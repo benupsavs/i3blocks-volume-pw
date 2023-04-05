@@ -4,10 +4,10 @@ use envconfig::Envconfig;
 use i3blocks_volume_pw::{Control, Config, parse_click};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let config = Config::init_from_env().expect("unable to read config from environment");
+    let config = Config::init_from_env()?;
     let mut control = Control::new(config);
     control.subscribe();
-    let tx = control.tx().unwrap();
+    let tx = control.tx().ok_or::<Box<dyn std::error::Error>>("tx not initialized".into())?;
 
     let t = thread::Builder::new().name("click listener".to_string()).stack_size(16 * 1024).spawn(move || {
         let mut input = BufReader::new(io::stdin());
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             line.clear();
         }
-    }).expect("create click listener thread");
+    })?;
     control.refresh_loop();
     _ = t.join();
 
