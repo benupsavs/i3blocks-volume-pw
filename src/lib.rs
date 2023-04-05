@@ -1,9 +1,12 @@
+mod protocol;
+use protocol::*;
+
 use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}};
 use lazy_static::lazy_static;
-use serde::{Serialize, Deserialize};
 
 use envconfig::Envconfig;
 use regex::Regex;
+
 
 const CHAR_AUDIO_MUTED:  char = '\u{1F507}';
 const CHAR_AUDIO_LOW:    char = '\u{1F508}';
@@ -14,6 +17,10 @@ const CHAR_AUDIO_HIGH:   char = '\u{1F50A}';
 pub struct Config {
     #[envconfig(from = "AUDIO_DELTA", default="5")]
     pub audio_delta: u8,
+    #[envconfig(from = "VOLUME_CONTROL_APP", default="pavucontrol")]
+    pub volume_control_app: String,
+    #[envconfig(from = "SHOW_DEVICE_NAME", default="false")]
+    pub show_device_name: bool,
 }
 
 fn get_default_sink_node_name() -> Option<String> {
@@ -68,7 +75,7 @@ fn fetch_sink_status() -> Vec<String> {
     full_output.lines().map(|l| l.to_owned()).collect()
 }
 
-pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>) -> String {
+pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> String {
     lazy_static!(
         static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
         static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
@@ -134,7 +141,7 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>) -> Stri
         }
 
         if !sink.got_sink_name {
-            if let Some(caps) = RE_SINK_NAME.captures(&line.trim_end()) {
+            if let Some(caps) = RE_SINK_NAME.captures(line.trim_end()) {
                 sink.sink_name = caps[1].to_string();
                 sink.got_sink_name = true;
                 continue;
@@ -156,11 +163,12 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>) -> Stri
     }
     // Fallback to the default sink reported by pactl
     if s.is_none() && default_sink_node.is_some() {
-        let d = default_sink_node.unwrap();
-        for sink in &sinks {
-            if sink.sink_name == d {
-                s = Some(sink);
-                break;
+        if let Some(d) = default_sink_node {
+            for sink in &sinks {
+                if sink.sink_name == d {
+                    s = Some(sink);
+                    break;
+                }
             }
         }
     }
@@ -170,30 +178,44 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>) -> Stri
     }
     let s = s.unwrap();
 
-    let mut output = String::new();
+    let mut output = Output::default();
+
+    let mut short_text = String::new();
     if s.mute {
-        output.extend([CHAR_AUDIO_MUTED, ' ']);
+        short_text.extend([CHAR_AUDIO_MUTED, ' ']);
     } else if s.volume_percent <= 20 {
-        output.extend([CHAR_AUDIO_LOW, ' ']);
+        short_text.extend([CHAR_AUDIO_LOW, ' ']);
     } else if s.volume_percent <= 60 {
-        output.extend([CHAR_AUDIO_MEDIUM, ' ']);
+        short_text.extend([CHAR_AUDIO_MEDIUM, ' ']);
     } else {
-        output.extend([CHAR_AUDIO_HIGH, ' ']);
+        short_text.extend([CHAR_AUDIO_HIGH, ' ']);
     }
 
-    output.extend([s.volume_percent.to_string()]);
-    output.extend(['%', ' ']);
-    output.extend(['[']);
-    output.extend([s.device_name.clone()]);
-    output.extend([']']);
+    short_text.extend([s.volume_percent.to_string()]);
+    short_text.extend(['%']);
 
-    output
+    let mut full_text = short_text.clone();
+    output.short_text = Some(&short_text);
+
+    if include_device_name {
+        full_text.extend([' ', '[']);
+        full_text.extend([s.device_name.clone()]);
+        full_text.extend([']']);
+    }
+    output.full_text = &full_text;
+    if s.volume_percent > 100 {
+        output.urgent = Some(true);
+    }
+
+    serde_json::to_string(&output).unwrap_or(String::new())
 }
 
 pub struct Control {
     sub: Mutex<Option<Subscription>>,
     active: bool,
+    show_device_name: bool,
     config: Config,
+    previous_line: String,
 }
 
 struct Subscription {
@@ -208,7 +230,9 @@ impl Control {
         Self {
             sub: Mutex::new(None),
             active: true,
+            show_device_name: config.show_device_name,
             config,
+            previous_line: String::new(),
         }
     }
 
@@ -238,7 +262,7 @@ impl Control {
         let (tx, rx): (Sender<u8>, Receiver<u8>) = mpsc::channel();
 
         let tx2 = tx.clone();
-        let jh: JoinHandle<()> = thread::spawn(move || {
+        let jh: JoinHandle<()> = thread::Builder::new().name("change listener".to_string()).stack_size(16 * 1024).spawn(move || {
             let tx = tx2;
             let output_result = Command::new("pactl")
                 .arg("subscribe")
@@ -251,10 +275,8 @@ impl Control {
                 loop {
                     match child_out.read_line(&mut line) {
                         Ok(_) => {
-                            if line.contains("change") {
-                                if let Err(_) = tx.send(0) {
-                                    return;
-                                }
+                            if line.contains("change") && tx.send(0).is_err() {
+                                return;
                             }
                         },
                         Err(_) => return,
@@ -262,7 +284,7 @@ impl Control {
                     line.clear();
                 }
             }
-        });
+        }).expect("create subscription thread");
         let sub = Subscription{
             j: jh,
             rx,
@@ -272,7 +294,8 @@ impl Control {
         *self.sub.lock().unwrap() = Some(sub);
     }
 
-    pub fn refresh_loop(&self) {
+    /// Receives events and writes updates to stdout.
+    pub fn refresh_loop(&mut self) {
         if let Ok(ref r1) = &self.sub.lock() {
             let r2 = r1.as_ref();
             if let Some(sub) = r2 {
@@ -284,9 +307,16 @@ impl Control {
                         _ = self.adjust_volume(self.config.audio_delta as i8);
                     } else if button == 5 {
                         _ = self.adjust_volume(-(self.config.audio_delta as i8));
+                    } else if button == 1 {
+                        _ = Command::new(&self.config.volume_control_app).spawn()
+                    } else if button == 3 {
+                        self.show_device_name = !self.show_device_name;
                     }
-                    let l = get_output(get_default_sink_node_name(), fetch_sink_status());
-                    println!("{l}");
+                    let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
+                    if l != self.previous_line {
+                        println!("{l}");
+                        self.previous_line = l;
+                    }
                 }
             }
         }
@@ -314,24 +344,8 @@ impl Drop for Control {
     }
 }
 
-fn parse_click(json: &str) -> serde_json::Result<Click> {
+pub fn parse_click(json: &str) -> serde_json::Result<Click> {
     serde_json::from_str(json)
-}
-
-#[derive(Serialize, Deserialize)]
-struct Click {
-    name: String,
-    instance: String,
-    button: u8,
-    modifiers: Vec<String>,
-    x: i16,
-    y: i16,
-    relative_x: i16,
-    relative_y: i16,
-    output_x: i16,
-    output_y: i16,
-    width: u16,
-    height: u16,
 }
 
 #[cfg(test)]
@@ -342,7 +356,7 @@ mod test {
     fn active_output() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines);
+        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -350,10 +364,21 @@ mod test {
     }
 
     #[test]
+    fn no_device_name() {
+        let response = include_str!("../tests/active.txt");
+        let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
+        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false);
+
+        assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
+        assert!(status_line.contains("40%"));
+        assert!(!status_line.contains("Creative USB Headset"));
+    }
+
+    #[test]
     fn inactive_output() {
         let response = include_str!("../tests/inactive.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines);
+        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -364,19 +389,31 @@ mod test {
     fn parse_click_ethernet() {
         let click_json = include_str!("../tests/click.json");
         let click = parse_click(click_json).unwrap();
-        assert_eq!("ethernet", click.name);
-        assert_eq!("eth0", click.instance);
-        assert_eq!(1 as u8, click.button);
-        assert_eq!(2, click.modifiers.len());
-        assert_eq!("Shift", click.modifiers[0]);
-        assert_eq!("Mod1", click.modifiers[1]);
-        assert_eq!(1925 as i16, click.x);
-        assert_eq!(1400 as i16, click.y);
-        assert_eq!(12 as i16, click.relative_x);
-        assert_eq!(8 as i16, click.relative_y);
-        assert_eq!(5 as i16, click.output_x);
-        assert_eq!(1400 as i16, click.output_y);
-        assert_eq!(50 as u16, click.width);
-        assert_eq!(22 as u16, click.height);
+        let modifiers = click.modifiers.unwrap();
+        assert_eq!(Some("ethernet"), click.name.as_deref());
+        assert_eq!(Some("eth0"), click.instance.as_deref());
+        assert_eq!(1_u8, click.button);
+        assert_eq!(2, modifiers.len());
+        assert_eq!("Shift", modifiers[0]);
+        assert_eq!("Mod1", modifiers[1]);
+        assert_eq!(1925_i16, click.x);
+        assert_eq!(1400_i16, click.y);
+        assert_eq!(12_i16, click.relative_x);
+        assert_eq!(8_i16, click.relative_y);
+        assert_eq!(5_i16, click.output_x.unwrap());
+        assert_eq!(1400_i16, click.output_y.unwrap());
+        assert_eq!(50_u16, click.width);
+        assert_eq!(22_u16, click.height);
+    }
+
+    #[test]
+    fn test_output() {
+        let o = Output{
+            full_text: "full text!",
+            ..Default::default()
+        };
+
+        let r = serde_json::to_string(&o).unwrap();
+        assert!(!r.is_empty());
     }
 }

@@ -1,0 +1,19 @@
+{
+    "full_text": "E: 10.0.0.1 (1000 Mbit/s)",
+    "short_text": "10.0.0.1",
+    "color": "#00ff00",
+    "background": "#1c1c1c",
+    "border": "#ee0000",
+    "border_top": 1,
+    "border_right": 0,
+    "border_bottom": 3,
+    "border_left": 1,
+    "min_width": 300,
+    "align": "right",
+    "urgent": false,
+    "name": "ethernet",
+    "instance": "eth0",
+    "separator": true,
+    "separator_block_width": 9,
+    "markup": "none"
+}
