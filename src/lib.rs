@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}};
+use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}, ops::Index};
 use lazy_static::lazy_static;
 
 use envconfig::Envconfig;
@@ -77,11 +77,11 @@ fn fetch_sink_status() -> Vec<String> {
 
 pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> String {
     lazy_static!(
-        static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
-        static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
-        static ref RE_VOLUME: Regex = Regex::new(r"^\t+?Volume:\s*(?:front-left|mono).*?\d*?(\d+?)%").unwrap();
+        static ref RE_MUTE:        Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
+        static ref RE_STATE:       Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
+        static ref RE_VOLUME:      Regex = Regex::new(r"^\t+?Volume:\s*(?:front-left|mono).*?\d*?(\d+?)%").unwrap();
         static ref RE_DEVICE_NAME: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
-        static ref RE_SINK_NAME: Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
+        static ref RE_SINK_NAME:   Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
 
     );
     let mut sinks = Vec::new();
@@ -346,6 +346,48 @@ impl Drop for Control {
 
 pub fn parse_click(json: &str) -> serde_json::Result<Click> {
     serde_json::from_str(json)
+}
+
+pub struct Port<'a1> {
+    pub name: &'a1 str,
+    pub priority: i16,
+    pub available: bool,
+}
+
+/// Parses the port string.
+///
+/// Ex: `analog-output-headphones: Headphones (type: Headphones, priority: 9900, availability group: Legacy 4, available)`
+pub fn parse_port<'a1>(port_str: &'a1 str) -> Option<Port<'a1>> {
+    let mut name: Option<&'a1 str> = None;
+    let mut priority: Option<i16> = None;
+    let mut available: Option<bool> = None;
+
+    let f = port_str.find('(');
+    if let Some(pf) = f {
+        let f = port_str.find(')');
+        if let Some(pt) = f {
+            let tags_str = &port_str[pf..pt];
+            let kvs = tags_str.split(", ");
+            for kv_str in kvs {
+                let kv: Vec<&str> = Vec::from_iter(kv_str.split(": "));
+                if kv.len() == 2 {
+                    if kv[0] == "type" {
+                        name = Some(kv[1]);
+                    } else if kv[0] == "priority" {
+                        priority = kv[1].parse::<i16>().ok();
+                    } else if kv[0] == "availability group" {
+                        available = Some(!kv[1].contains("not available"));
+                    }
+                }
+            }
+        }
+    }
+
+    if name.is_some() && priority.is_some() && available.is_some() {
+        return Some(Port { name: name.unwrap(), priority: priority.unwrap(), available: available.unwrap() });
+    }
+
+    None
 }
 
 #[cfg(test)]
