@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}, ops::Index};
+use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}};
 use lazy_static::lazy_static;
 
 use envconfig::Envconfig;
@@ -350,8 +350,7 @@ pub fn parse_click(json: &str) -> serde_json::Result<Click> {
 
 pub struct Port<'a1> {
     pub name: &'a1 str,
-    pub priority: i16,
-    pub available: bool,
+    pub port_type: &'a1 str,
 }
 
 /// Parses the port string.
@@ -359,32 +358,32 @@ pub struct Port<'a1> {
 /// Ex: `analog-output-headphones: Headphones (type: Headphones, priority: 9900, availability group: Legacy 4, available)`
 pub fn parse_port<'a1>(port_str: &'a1 str) -> Option<Port<'a1>> {
     let mut name: Option<&'a1 str> = None;
-    let mut priority: Option<i16> = None;
-    let mut available: Option<bool> = None;
+    let mut port_type: Option<&'a1 str> = None;
+    let ps = port_str.trim();
 
-    let f = port_str.find('(');
+    if let Some(cp) = ps.find(':') {
+        name = Some(&ps[0..cp]);
+    }
+
+    let f = ps.find('(');
     if let Some(pf) = f {
-        let f = port_str.find(')');
+        let f = ps.find(')');
         if let Some(pt) = f {
-            let tags_str = &port_str[pf..pt];
+            let tags_str = &ps[pf + 1..pt];
             let kvs = tags_str.split(", ");
             for kv_str in kvs {
                 let kv: Vec<&str> = Vec::from_iter(kv_str.split(": "));
-                if kv.len() == 2 {
-                    if kv[0] == "type" {
-                        name = Some(kv[1]);
-                    } else if kv[0] == "priority" {
-                        priority = kv[1].parse::<i16>().ok();
-                    } else if kv[0] == "availability group" {
-                        available = Some(!kv[1].contains("not available"));
-                    }
+                if kv.len() == 2 && kv[0] == "type" {
+                    port_type = Some(kv[1]);
                 }
             }
         }
     }
 
-    if name.is_some() && priority.is_some() && available.is_some() {
-        return Some(Port { name: name.unwrap(), priority: priority.unwrap(), available: available.unwrap() });
+    if let Some(name) = name {
+        if let Some(port_type) = port_type {
+            return Some(Port { name, port_type });
+        }
     }
 
     None
@@ -457,5 +456,15 @@ mod test {
 
         let r = serde_json::to_string(&o).unwrap();
         assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn parse_port_headphones_1() {
+        let port_str = "analog-output-headphones: Headphones (type: Headphones, priority: 9900, availability group: Legacy 4, available)";
+        let p = parse_port(port_str);
+        assert!(p.is_some());
+        let p = p.unwrap();
+        assert_eq!("analog-output-headphones", p.name);
+        assert_eq!("Headphones", p.port_type);
     }
 }

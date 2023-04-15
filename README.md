@@ -19,6 +19,8 @@ cp target/release/i3blocks-volume-pw ~/.config/i3blocks/
 ```
 
 ## Configure
+Add the block config to `~/.config/i3blocks/config`:
+
 ```
 [i3blocks-volume-pw]
 command=env AUDIO_DELTA=2 $HOME/.config/i3blocks/i3blocks-volume-pw
@@ -26,4 +28,4 @@ interval=persist
 format=json
 ```
 
-Log out and back in.
+Reload your WM or log out and back in or reboot.
