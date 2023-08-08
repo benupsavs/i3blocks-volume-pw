@@ -7,10 +7,13 @@ use lazy_static::lazy_static;
 use envconfig::Envconfig;
 use regex::Regex;
 
-
+/// Character representing muted audio.
 const CHAR_AUDIO_MUTED:  char = '\u{1F507}';
+/// Character representing a low volume level.
 const CHAR_AUDIO_LOW:    char = '\u{1F508}';
+/// Character representing a medium volume level.
 const CHAR_AUDIO_MEDIUM: char = '\u{1F509}';
+/// Character representing a high volume level.
 const CHAR_AUDIO_HIGH:   char = '\u{1F50A}';
 
 #[derive(Envconfig)]
@@ -23,6 +26,7 @@ pub struct Config {
     pub show_device_name: bool,
 }
 
+/// Gets the node name of the default PipeWire audio sink.
 fn get_default_sink_node_name() -> Option<String> {
     match Command::new("pactl")
         .arg("get-default-sink")
@@ -39,6 +43,7 @@ fn get_default_sink_node_name() -> Option<String> {
         }
 }
 
+/// Represents a PipeWire audio sink.
 #[derive(Clone)]
 struct Sink {
     volume_percent: u16,
@@ -53,6 +58,7 @@ struct Sink {
 }
 
 impl Sink {
+    /// Reverts all fields to the default state.
     fn clear(&mut self) {
         self.volume_percent = 0;
         self.device_name = String::new();
@@ -66,6 +72,8 @@ impl Sink {
     }
 }
 
+/// Fetches the PipeWire audio sink status as a list of lines
+/// from the output of the `pactl list sinks` command.
 fn fetch_sink_status() -> Vec<String> {
     let output = Command::new("pactl")
         .args(["list", "sinks"])
@@ -75,6 +83,7 @@ fn fetch_sink_status() -> Vec<String> {
     full_output.lines().map(|l| l.to_owned()).collect()
 }
 
+/// Gets the output to be displayed to the user.
 pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> String {
     lazy_static!(
         static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
@@ -210,18 +219,20 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     serde_json::to_string(&output).unwrap_or(String::new())
 }
 
+/// Subscription to PipeWire audio events.
+struct Subscription {
+    j: JoinHandle<()>,
+    tx: Sender<u8>,
+    rx: Receiver<u8>,
+}
+
+/// PipeWire audio control API.
 pub struct Control {
     sub: Mutex<Option<Subscription>>,
     active: bool,
     show_device_name: bool,
     config: Config,
     previous_line: String,
-}
-
-struct Subscription {
-    j: JoinHandle<()>,
-    tx: Sender<u8>,
-    rx: Receiver<u8>,
 }
 
 impl Control {
@@ -236,7 +247,7 @@ impl Control {
         }
     }
 
-    /// Adjusts the volume by the given amount.
+    /// Adjusts the volume by the given amount. Negative values request lowering the volume.
     pub fn adjust_volume(&self, delta: i8) -> Result<(), Box<dyn Error>> {
         if delta == 0 {
             return Ok(())
@@ -266,7 +277,7 @@ impl Control {
             let tx = tx2;
             let output_result = Command::new("pactl")
                 .arg("subscribe")
-                .stdin(Stdio::piped())
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .spawn();
             if let Ok(mut output) = output_result {
@@ -274,8 +285,8 @@ impl Control {
                 let mut line = String::new();
                 loop {
                     match child_out.read_line(&mut line) {
-                        Ok(_) => {
-                            if line.contains("change") && tx.send(0).is_err() {
+                        Ok(n) => {
+                            if n == 0 /* EOF */ || (line.contains("change") && tx.send(0).is_err()) {
                                 return;
                             }
                         },
@@ -296,11 +307,14 @@ impl Control {
 
     /// Receives events and writes updates to stdout.
     pub fn refresh_loop(&mut self) {
+        let lock = Mutex::new(0);
+
         if let Ok(ref r1) = &self.sub.lock() {
             let r2 = r1.as_ref();
             if let Some(sub) = r2 {
                 let rx = &sub.rx;
                 while let Ok(button) = rx.recv() {
+                    let mut force_update = true;
                     if button == 2 {
                         _ = self.toggle_mute();
                     } else if button == 4 {
@@ -311,11 +325,22 @@ impl Control {
                         _ = Command::new(&self.config.volume_control_app).spawn()
                     } else if button == 3 {
                         self.show_device_name = !self.show_device_name;
+                    } else {
+                        force_update = false;
                     }
-                    let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
-                    if l != self.previous_line {
-                        println!("{l}");
-                        self.previous_line = l;
+                    let mut do_update = force_update;
+                    let acquired: Result<_, _>;
+                    if !do_update {
+                        acquired = lock.try_lock();
+                        do_update = acquired.is_ok();
+                    }
+
+                    if do_update {
+                        let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
+                        if l != self.previous_line {
+                            println!("{l}");
+                            self.previous_line = l;
+                        }
                     }
                 }
             }
@@ -344,6 +369,7 @@ impl Drop for Control {
     }
 }
 
+/// Parses the i3block JSON that occurs as a result of a user mouse click.
 pub fn parse_click(json: &str) -> serde_json::Result<Click> {
     serde_json::from_str(json)
 }
