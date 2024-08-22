@@ -44,7 +44,7 @@ fn get_default_sink_node_name() -> Option<String> {
 }
 
 /// Represents a PipeWire audio sink.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Sink {
     volume_percent: u16,
     device_name: String,
@@ -89,22 +89,13 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
         static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
         static ref RE_VOLUME: Regex = Regex::new(r"^\t+?Volume:\s*(?:front-left|mono).*?\d*?(\d+?)%").unwrap();
-        static ref RE_DEVICE_NAME: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
+        static ref RE_DEVICE_NAME_1: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
+        static ref RE_DEVICE_NAME_2: Regex = Regex::new(r#"^\t\tdevice\.alias\s=\s"([^"]+?)""#).unwrap();
         static ref RE_SINK_NAME: Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
 
     );
     let mut sinks = Vec::new();
-    let mut sink = Sink{
-        volume_percent: 0,
-        device_name: String::new(),
-        mute: false,
-        active: false,
-        got_mute: false,
-        got_volume: false,
-        got_device_name: false,
-        sink_name: String::new(),
-        got_sink_name: false,
-    };
+    let mut sink = Sink::default();
     let mut got_sink = false;
     for line in lines {
         if line.starts_with("Sink") {
@@ -142,10 +133,13 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         }
 
         if !sink.got_device_name {
-            if let Some(caps) = RE_DEVICE_NAME.captures(&line) {
+            if let Some(caps) = RE_DEVICE_NAME_1.captures(&line) {
                 sink.device_name = caps[1].to_string();
-                sink.got_device_name = true;
+                sink.got_device_name = !sink.device_name.is_empty();
                 continue;
+            } else if let Some(caps) = RE_DEVICE_NAME_2.captures(&line) {
+                sink.device_name = caps[1].to_string();
+                sink.got_device_name = !sink.device_name.is_empty();
             }
         }
 
