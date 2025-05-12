@@ -14,7 +14,7 @@ Mouse wheel raises and lowers the playback volume. The delta is configured using
 Check out sources
 ```bash
 cd /path/to/i3blocks-volume-pw
-cargo build
+cargo build --release
 cp target/release/i3blocks-volume-pw ~/.config/i3blocks/
 ```
 
