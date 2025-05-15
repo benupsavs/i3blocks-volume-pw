@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{process::{Command, Stdio}, error::Error, thread::{self, JoinHandle}, io::{BufReader, BufRead}, sync::{mpsc::{Sender, Receiver, self}, Mutex}};
+use std::{error::Error, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
 use lazy_static::lazy_static;
 
 use envconfig::Envconfig;
@@ -24,6 +24,8 @@ pub struct Config {
     pub volume_control_app: String,
     #[envconfig(from = "SHOW_DEVICE_NAME", default="false")]
     pub show_device_name: bool,
+    #[envconfig(from = "PRINT_HEADER", default="false")]
+    pub print_header: bool,
 }
 
 /// Gets the node name of the default PipeWire audio sink.
@@ -209,6 +211,9 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     if s.volume_percent > 100 {
         output.urgent = Some(true);
     }
+    if output.short_text.is_some() && output.full_text == output.short_text.unwrap() {
+        output.short_text = None;
+    }
 
     serde_json::to_string(&output).unwrap_or(String::new())
 }
@@ -301,44 +306,59 @@ impl Control {
 
     /// Receives events and writes updates to stdout.
     pub fn refresh_loop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        if self.config.print_header {
+            // Print i3bar header, which may not be required for i3blocks.
+            let header = protocol::Header {
+                version: 1,
+                click_events: Some(true),
+                ..Default::default()
+            };
+            let header_str = serde_json::to_string(&header).unwrap();
+            writeln!(stdout, "{header_str}").unwrap();
+        }
         let lock = Mutex::new(0);
 
         if let Ok(ref r1) = &self.sub.lock() {
             let r2 = r1.as_ref();
             if let Some(sub) = r2 {
                 let rx = &sub.rx;
-                while let Ok(button) = rx.recv() {
-                    let mut force_update = true;
-                    if button == 2 {
-                        _ = self.toggle_mute();
-                    } else if button == 4 {
-                        _ = self.adjust_volume(self.config.audio_delta as i8);
-                    } else if button == 5 {
-                        _ = self.adjust_volume(-(self.config.audio_delta as i8));
-                    } else if button == 1 {
-                        _ = Command::new(&self.config.volume_control_app).spawn()
-                    } else if button == 3 {
-                        self.show_device_name = !self.show_device_name;
-                    } else {
-                        force_update = false;
-                    }
-                    let mut do_update = force_update;
-                    let acquired: Result<_, _>;
-                    if !do_update {
-                        acquired = lock.try_lock();
-                        do_update = acquired.is_ok();
-                    }
+                while self.active {
+                    while let Ok(button) = rx.recv() {
+                        let mut force_update = true;
+                        if button == 2 {
+                            _ = self.toggle_mute();
+                        } else if button == 4 {
+                            _ = self.adjust_volume(self.config.audio_delta as i8);
+                        } else if button == 5 {
+                            _ = self.adjust_volume(-(self.config.audio_delta as i8));
+                        } else if button == 1 {
+                            _ = Command::new(&self.config.volume_control_app).spawn()
+                        } else if button == 3 {
+                            self.show_device_name = !self.show_device_name;
+                        } else {
+                            force_update = false;
+                        }
+                        let mut do_update = force_update;
+                        let acquired: Result<_, _>;
+                        if !do_update {
+                            acquired = lock.try_lock();
+                            do_update = acquired.is_ok();
+                        }
 
-                    if do_update {
-                        let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
-                        if l != self.previous_line {
-                            println!("{l}");
-                            self.previous_line = l;
+                        if do_update {
+                            let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
+                            if l != self.previous_line {
+                                writeln!(stdout, "{l}").unwrap();
+                                io::stdout().flush().unwrap();
+                                self.previous_line = l;
+                            }
                         }
                     }
                 }
             }
         }
+        self.active = false;
     }
 
     pub fn tx(&self) -> Option<Sender<u8>> {

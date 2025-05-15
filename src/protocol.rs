@@ -17,6 +17,19 @@ pub struct Click {
     pub height: u16,
 }
 
+/// i3bar protocol header JSON object.
+/// The header is sent first and contains the version of the protocol.
+#[derive(Serialize, Default)]
+pub struct Header {
+    pub version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub click_events: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cont_signal: Option<u8>,
+}
+
 /// i3bar protocol output JSON object.
 #[derive(Serialize, Default)]
 pub struct Output<'a1> {
