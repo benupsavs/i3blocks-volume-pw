@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 
 use envconfig::Envconfig;
 use regex::Regex;
+use std::time::{Duration, Instant};
 
 /// Character representing muted audio.
 const CHAR_AUDIO_MUTED:  char = '\u{1F507}';
@@ -26,6 +27,8 @@ pub struct Config {
     pub show_device_name: bool,
     #[envconfig(from = "PRINT_HEADER", default="false")]
     pub print_header: bool,
+    #[envconfig(from = "USE_WOB", default="false")]
+    pub use_wob: bool,
 }
 
 /// Gets the node name of the default PipeWire audio sink.
@@ -86,7 +89,9 @@ fn fetch_sink_status() -> Vec<String> {
 }
 
 /// Gets the output to be displayed to the user.
-pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> String {
+/// The first element of the tuple is the status line,
+/// and the second element is the volume percentage to display to the user.
+pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> (String, u16) {
     lazy_static!(
         static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
         static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
@@ -156,7 +161,7 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     if got_sink {
         sinks.push(sink);
     } else {
-        return String::new();
+        return (String::new(), 0);
     }
     let mut s: Option<&Sink> = None;
     // Try to match the active sink
@@ -215,7 +220,7 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         output.short_text = None;
     }
 
-    serde_json::to_string(&output).unwrap_or(String::new())
+    (serde_json::to_string(&output).unwrap_or(String::new()), if s.mute { 0 } else { s.volume_percent })
 }
 
 /// Subscription to PipeWire audio events.
@@ -274,24 +279,38 @@ impl Control {
         let tx2 = tx.clone();
         let jh: JoinHandle<()> = thread::Builder::new().name("change listener".to_string()).stack_size(16 * 1024).spawn(move || {
             let tx = tx2;
-            let output_result = Command::new("pactl")
-                .arg("subscribe")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .spawn();
-            if let Ok(mut output) = output_result {
-                let mut child_out = BufReader::new(output.stdout.as_mut().unwrap());
-                let mut line = String::new();
-                loop {
-                    match child_out.read_line(&mut line) {
-                        Ok(n) => {
-                            if n == 0 /* EOF */ || (line.contains("change") && tx.send(0).is_err()) {
-                                return;
-                            }
-                        },
-                        Err(_) => return,
+            let mut failures = Vec::new();
+
+            loop {
+                let input_result = Command::new("pactl")
+                    .arg("subscribe")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn();
+
+                if let Ok(mut output) = input_result {
+                    let mut child_out = BufReader::new(output.stdout.as_mut().unwrap());
+                    let mut line = String::new();
+                    loop {
+                        match child_out.read_line(&mut line) {
+                            Ok(n) => {
+                                if n == 0 /* EOF */ || (line.contains("change") && tx.send(0).is_err()) {
+                                    return;
+                                }
+                            },
+                            Err(_) => return,
+                        }
+                        line.clear();
                     }
-                    line.clear();
+                } else {
+                    // Track failures and only allow 3 in the past second
+                    let now = Instant::now();
+                    failures.retain(|&t| now.duration_since(t) < Duration::from_secs(1));
+                    failures.push(now);
+                    if failures.len() > 3 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(200));
                 }
             }
         }).expect("create subscription thread");
@@ -319,7 +338,25 @@ impl Control {
         }
         let lock = Mutex::new(0);
 
+        let wob;
+        if self.config.use_wob {
+            let spawn_result = Command::new("wob")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn();
+            if let Ok(child) = spawn_result {
+                wob = Some(child);
+            } else {
+                eprintln!("Failed to spawn wob: {:?}", spawn_result);
+                wob = None;
+            }
+        } else {
+            wob = None;
+        }
+
         if let Ok(ref r1) = &self.sub.lock() {
+            let mut first_update = true;
+            let mut last_volume = 0u16;
             let r2 = r1.as_ref();
             if let Some(sub) = r2 {
                 let rx = &sub.rx;
@@ -347,12 +384,22 @@ impl Control {
                         }
 
                         if do_update {
-                            let l = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
+                            let (l, volume_percent) = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
                             if l != self.previous_line {
                                 writeln!(stdout, "{l}").unwrap();
                                 io::stdout().flush().unwrap();
                                 self.previous_line = l;
                             }
+                            if last_volume != volume_percent && !first_update {
+                                if let Some(w) = &wob {
+                                    let mut child_in = w.stdin.as_ref().unwrap();
+                                    child_in.write_all(volume_percent.to_string().as_bytes()).unwrap();
+                                    child_in.write_all(b"\n").unwrap();
+                                    child_in.flush().unwrap();
+                                }
+                            }
+                            first_update = false;
+                            last_volume = volume_percent;
                         }
                     }
                 }
@@ -396,33 +443,36 @@ mod test {
     fn active_output() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
         assert!(status_line.contains("Creative USB Headset"));
+        assert!(volume == 40);
     }
 
     #[test]
     fn no_device_name() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false);
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
         assert!(!status_line.contains("Creative USB Headset"));
+        assert!(volume == 40);
     }
 
     #[test]
     fn inactive_output() {
         let response = include_str!("../tests/inactive.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let status_line = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
         assert!(status_line.contains("Creative USB Headset"));
+        assert!(volume == 40);
     }
 
     #[test]
