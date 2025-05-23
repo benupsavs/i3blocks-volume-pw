@@ -32,21 +32,21 @@ pub struct Header {
 
 /// i3bar protocol output JSON object.
 #[derive(Serialize, Default)]
-pub struct Output<'a1> {
+pub struct Output {
     /// Ex: `E: 10.0.0.1 (1000 Mbit/s)`
-    pub full_text: &'a1 str,
+    pub full_text: String,
     /// Ex: `10.0.0.1`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub short_text: Option<&'a1 str>,
+    pub short_text: Option<String>,
     /// Ex: `#00ff00`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<&'a1 str>,
+    pub color: Option<String>,
     /// Ex: `#1c1c1c`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub background: Option<&'a1 str>,
+    pub background: Option<String>,
     /// Ex: `#ee0000`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub border: Option<&'a1 str>,
+    pub border: Option<String>,
     /// Ex: `1`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub border_top: Option<i16>,
@@ -64,16 +64,16 @@ pub struct Output<'a1> {
     pub min_width: Option<u16>,
     /// Ex: `right`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub align: Option<&'a1 str>,
+    pub align: Option<String>,
     /// Ex: `false`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urgent: Option<bool>,
     /// Ex: `ethernet`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<&'a1 str>,
+    pub name: Option<String>,
     /// Ex: `eth0`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instance: Option<&'a1 str>,
+    pub instance: Option<String>,
     /// Ex: `true`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub separator: Option<bool>,
@@ -82,5 +82,5 @@ pub struct Output<'a1> {
     pub separator_block_width: Option<u16>,
     /// Ex: `none`, `pango`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub markup: Option<&'a1 str>,
+    pub markup: Option<String>,
 }

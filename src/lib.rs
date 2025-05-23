@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{error::Error, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
+use std::{error::Error, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio, ChildStdin}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
 use lazy_static::lazy_static;
 
 use envconfig::Envconfig;
@@ -31,20 +31,25 @@ pub struct Config {
     pub use_wob: bool,
 }
 
+lazy_static! {
+    static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
+    static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
+    static ref RE_VOLUME: Regex = Regex::new(r"^\t+?Volume:\s*(?:front-left|mono).*?\d*?(\d+?)%").unwrap();
+    static ref RE_DEVICE_NAME_1: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
+    static ref RE_DEVICE_NAME_2: Regex = Regex::new(r#"^\t\tdevice\.alias\s=\s"([^"]+?)""#).unwrap();
+    static ref RE_SINK_NAME: Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
+}
+
 /// Gets the node name of the default PipeWire audio sink.
 fn get_default_sink_node_name() -> Option<String> {
     match Command::new("pactl")
         .arg("get-default-sink")
         .output() {
-            Ok(output) => {
-                let full_output = String::from_utf8_lossy(&output.stdout).to_string();
-                if full_output.len() <= 1 {
-                    return None;
-                }
-
-                Some(full_output[0..full_output.len() - 1].to_string())
-            },
-            Err(_) => None,
+            Ok(output) if output.status.success() => {
+                let name = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+                if name.is_empty() { None } else { Some(name) }
+            }
+            _ => None,
         }
 }
 
@@ -79,28 +84,22 @@ impl Sink {
 
 /// Fetches the PipeWire audio sink status as a list of lines
 /// from the output of the `pactl list sinks` command.
-fn fetch_sink_status() -> Vec<String> {
+fn fetch_sink_status() -> Result<Vec<String>, Box<dyn Error>> {
     let output = Command::new("pactl")
         .args(["list", "sinks"])
-        .output()
-        .unwrap();
-    let full_output = String::from_utf8_lossy(&output.stdout).to_string();
-    full_output.lines().map(|l| l.to_owned()).collect()
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("pactl list sinks failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let full_output = String::from_utf8_lossy(&output.stdout);
+    Ok(full_output.lines().map(|l| l.to_owned()).collect())
+
 }
 
 /// Gets the output to be displayed to the user.
 /// The first element of the tuple is the status line,
 /// and the second element is the volume percentage to display to the user.
-pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> (String, u16) {
-    lazy_static!(
-        static ref RE_MUTE: Regex = Regex::new(r"^\t+?Mute: (\w+)").unwrap();
-        static ref RE_STATE: Regex = Regex::new(r"^\t+?State: (\w+)").unwrap();
-        static ref RE_VOLUME: Regex = Regex::new(r"^\t+?Volume:\s*(?:front-left|mono).*?\d*?(\d+?)%").unwrap();
-        static ref RE_DEVICE_NAME_1: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
-        static ref RE_DEVICE_NAME_2: Regex = Regex::new(r#"^\t\tdevice\.alias\s=\s"([^"]+?)""#).unwrap();
-        static ref RE_SINK_NAME: Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
-
-    );
+pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> Result<(String, u16), Box<dyn Error>> {
     let mut sinks = Vec::new();
     let mut sink = Sink::default();
     let mut got_sink = false;
@@ -161,7 +160,7 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     if got_sink {
         sinks.push(sink);
     } else {
-        return (String::new(), 0);
+        return Ok((String::new(), 0)); // No sinks found
     }
     let mut s: Option<&Sink> = None;
     // Try to match the active sink
@@ -183,71 +182,69 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         }
     }
     // If no active or default sinks, use the first one
-    if s.is_none() {
+    if s.is_none() && !sinks.is_empty() {
         s = Some(&sinks[0]);
+    } else if s.is_none() {
+        return Ok((String::new(), 0)); // No suitable sink
     }
     let s = s.unwrap();
 
     let mut output = Output::default();
 
-    let mut short_text = String::new();
-    if s.mute {
-        short_text.extend([CHAR_AUDIO_MUTED, ' ']);
+    let icon_char = if s.mute {
+        CHAR_AUDIO_MUTED
     } else if s.volume_percent <= 20 {
-        short_text.extend([CHAR_AUDIO_LOW, ' ']);
+        CHAR_AUDIO_LOW
     } else if s.volume_percent <= 60 {
-        short_text.extend([CHAR_AUDIO_MEDIUM, ' ']);
+        CHAR_AUDIO_MEDIUM
     } else {
-        short_text.extend([CHAR_AUDIO_HIGH, ' ']);
-    }
+        CHAR_AUDIO_HIGH
+    };
 
-    short_text.extend([s.volume_percent.to_string()]);
-    short_text.extend(['%']);
+    let base_text = format!("{} {}%", icon_char, s.volume_percent);
 
-    let mut full_text = short_text.clone();
-    output.short_text = Some(&short_text);
-
-    if include_device_name {
-        full_text.extend([' ', '[']);
-        full_text.extend([s.device_name.clone()]);
-        full_text.extend([']']);
-    }
-    output.full_text = &full_text;
-    if s.volume_percent > 100 {
-        output.urgent = Some(true);
-    }
-    if output.short_text.is_some() && output.full_text == output.short_text.unwrap() {
+    if include_device_name && !s.device_name.is_empty() {
+        output.full_text = format!("{} [{}]", base_text, s.device_name);
+        output.short_text = Some(base_text);
+    } else {
+        output.full_text = base_text;
         output.short_text = None;
     }
 
-    (serde_json::to_string(&output).unwrap_or(String::new()), if s.mute { 0 } else { s.volume_percent })
-}
+    if s.volume_percent > 100 {
+        output.urgent = Some(true);
+    }
 
-/// Subscription to PipeWire audio events.
-struct Subscription {
-    j: JoinHandle<()>,
-    tx: Sender<u8>,
-    rx: Receiver<u8>,
+    let json_output = serde_json::to_string(&output)
+        .map_err(|e| format!("Failed to serialize output: {}", e))?;
+    Ok((json_output, if s.mute { 0 } else { s.volume_percent }))
 }
 
 /// PipeWire audio control API.
 pub struct Control {
-    sub: Mutex<Option<Subscription>>,
+    pactl_event_thread_handle: Mutex<Option<JoinHandle<()>>>,
+    event_tx: Sender<u8>,
+    event_rx: Option<Receiver<u8>>,
     active: bool,
     show_device_name: bool,
     config: Config,
     previous_line: String,
+    wob_stdin: Mutex<Option<ChildStdin>>,
 }
 
 impl Control {
     /// Gets the control for the given mixer.
     pub fn new(config: Config) -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
         Self {
-            sub: Mutex::new(None),
+            pactl_event_thread_handle: Mutex::new(None),
+            event_tx,
+            event_rx: Some(event_rx),
             active: true,
             show_device_name: config.show_device_name,
             config,
             previous_line: String::new(),
+            wob_stdin: Mutex::new(None),
         }
     }
 
@@ -273,159 +270,192 @@ impl Control {
     }
 
     /// Subscribes to change events.
-    pub fn subscribe(&mut self) {
-        let (tx, rx): (Sender<u8>, Receiver<u8>) = mpsc::channel();
+    pub fn subscribe(&mut self) -> Result<(), Box<dyn Error>> {
+        let tx_for_pactl_thread = self.event_tx.clone();
+        let jh: JoinHandle<()> = thread::Builder::new()
+            .name("pactl_subscribe_listener".to_string())
+            .stack_size(16 * 1024)
+            .spawn(move || {
+                let mut failures = Vec::new();
+                loop {
+                    let cmd_result = Command::new("pactl")
+                        .arg("subscribe")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped()) // Capture stderr for better error reporting
+                        .spawn();
 
-        let tx2 = tx.clone();
-        let jh: JoinHandle<()> = thread::Builder::new().name("change listener".to_string()).stack_size(16 * 1024).spawn(move || {
-            let tx = tx2;
-            let mut failures = Vec::new();
+                    match cmd_result {
+                        Ok(mut child) => {
+                            if let Some(stdout) = child.stdout.take() {
+                                let mut reader = BufReader::new(stdout);
+                                let mut line = String::new();
+                                loop {
+                                    match reader.read_line(&mut line) {
+                                        Ok(0) => break, // EOF, pactl exited
+                                        Ok(_) => {
+                                            if line.contains("change") {
+                                                if tx_for_pactl_thread.send(0).is_err() {
+                                                    // Receiver is gone, main loop likely exited
+                                                    _ = child.wait(); // Ensure child process is cleaned up
+                                                    return;
+                                                }
+                                            }
+                                            line.clear();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Error reading from pactl subscribe: {}", e);
+                                            break; // Error, break to retry spawning pactl
+                                        }
+                                    }
 
-            loop {
-                let input_result = Command::new("pactl")
-                    .arg("subscribe")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .spawn();
-
-                if let Ok(mut output) = input_result {
-                    let mut child_out = BufReader::new(output.stdout.as_mut().unwrap());
-                    let mut line = String::new();
-                    loop {
-                        match child_out.read_line(&mut line) {
-                            Ok(n) => {
-                                if n == 0 /* EOF */ || (line.contains("change") && tx.send(0).is_err()) {
-                                    return;
                                 }
-                            },
-                            Err(_) => return,
+                            } else {
+                                eprintln!("pactl subscribe: stdout not available.");
+                            }
+                            // Ensure that the child process is cleaned up and check status
+                            match child.wait() {
+                                Ok(status) => if !status.success() {
+                                    if let Some(code) = status.code() {
+                                        eprintln!("'pactl subscribe' exited with code: {}", code);
+                                    } else {
+                                        eprintln!("'pactl subscribe' terminated by signal");
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to wait on 'pactl subscribe': {}", e),
+                            }
                         }
-                        line.clear();
+                        Err(e) => {
+                            eprintln!("Failed to spawn 'pactl subscribe': {}", e);
+                            // Track failures and only allow 3 in the past second to prevent busy-looping
+                            let now = Instant::now();
+                            failures.retain(|&t| now.duration_since(t) < Duration::from_secs(1));
+                            failures.push(now);
+                            if failures.len() > 3 {
+                                eprintln!("'pactl subscribe' failed too many times, listener thread exiting.");
+                                return; // Exit thread
+                            }
+                            thread::sleep(Duration::from_millis(500)); // Wait before retrying
+                        }
                     }
-                } else {
-                    // Track failures and only allow 3 in the past second
-                    let now = Instant::now();
-                    failures.retain(|&t| now.duration_since(t) < Duration::from_secs(1));
-                    failures.push(now);
-                    if failures.len() > 3 {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(200));
+                // Thread ends if loop is exited (e.g., due to too many failures or sender dropping)
                 }
-            }
-        }).expect("create subscription thread");
-        let sub = Subscription{
-            j: jh,
-            rx,
-            tx,
-        };
+            })
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-        *self.sub.lock().unwrap() = Some(sub);
+        *self.pactl_event_thread_handle.lock().unwrap() = Some(jh);
+        Ok(())
     }
 
     /// Receives events and writes updates to stdout.
     pub fn refresh_loop(&mut self) {
+        // Take the receiver. If it's already taken, something is wrong.
+        let event_rx = self.event_rx.take().expect("event_rx already taken in refresh_loop");
+
         let mut stdout = io::stdout().lock();
         if self.config.print_header {
-            // Print i3bar header, which may not be required for i3blocks.
-            let header = protocol::Header {
+            // Print i3bar header
+            let header = Header {
                 version: 1,
                 click_events: Some(true),
                 ..Default::default()
             };
             let header_str = serde_json::to_string(&header).unwrap();
-            writeln!(stdout, "{header_str}").unwrap();
+            if writeln!(stdout, "{}", header_str).is_err() { self.active = false; return; }
+            if stdout.flush().is_err() { self.active = false; return; }
         }
-        let lock = Mutex::new(0);
 
-        let wob;
         if self.config.use_wob {
             let spawn_result = Command::new("wob")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn();
-            if let Ok(child) = spawn_result {
-                wob = Some(child);
+            if let Ok(mut child) = spawn_result {
+                *self.wob_stdin.lock().unwrap() = child.stdin.take();
             } else {
                 eprintln!("Failed to spawn wob: {:?}", spawn_result);
-                wob = None;
             }
-        } else {
-            wob = None;
         }
 
-        if let Ok(ref r1) = &self.sub.lock() {
-            let mut first_update = true;
-            let mut last_volume = 0u16;
-            let r2 = r1.as_ref();
-            if let Some(sub) = r2 {
-                let rx = &sub.rx;
-                while self.active {
-                    while let Ok(button) = rx.recv() {
-                        let mut force_update = true;
-                        if button == 2 {
-                            _ = self.toggle_mute();
-                        } else if button == 4 {
-                            _ = self.adjust_volume(self.config.audio_delta as i8);
-                        } else if button == 5 {
-                            _ = self.adjust_volume(-(self.config.audio_delta as i8));
-                        } else if button == 1 {
-                            _ = Command::new(&self.config.volume_control_app).spawn()
-                        } else if button == 3 {
-                            self.show_device_name = !self.show_device_name;
-                        } else {
-                            force_update = false;
-                        }
-                        let mut do_update = force_update;
-                        let acquired: Result<_, _>;
-                        if !do_update {
-                            acquired = lock.try_lock();
-                            do_update = acquired.is_ok();
-                        }
+        let mut first_update = true;
+        let mut last_volume = 0u16;
 
-                        if do_update {
-                            let (l, volume_percent) = get_output(get_default_sink_node_name(), fetch_sink_status(), self.show_device_name);
-                            if l != self.previous_line {
-                                writeln!(stdout, "{l}").unwrap();
-                                io::stdout().flush().unwrap();
-                                self.previous_line = l;
-                            }
-                            if last_volume != volume_percent && !first_update {
-                                if let Some(w) = &wob {
-                                    let mut child_in = w.stdin.as_ref().unwrap();
-                                    child_in.write_all(volume_percent.to_string().as_bytes()).unwrap();
-                                    child_in.write_all(b"\n").unwrap();
-                                    child_in.flush().unwrap();
+        while self.active {
+            match event_rx.recv_timeout(Duration::from_secs(1)) { // Use recv_timeout to periodically check self.active
+                Ok(button) => {
+                    let mut action_affects_display = false;
+
+                    if button == 2 { // Mute toggle
+                        _ = self.toggle_mute().map_err(|e| eprintln!("Error toggling mute: {}", e));
+                        action_affects_display = true;
+                    } else if button == 4 { // Volume up
+                        _ = self.adjust_volume(self.config.audio_delta as i8).map_err(|e| eprintln!("Error adjusting volume up: {}", e));
+                        action_affects_display = true;
+                    } else if button == 5 { // Volume down
+                        _ = self.adjust_volume(-(self.config.audio_delta as i8)).map_err(|e| eprintln!("Error adjusting volume down: {}", e));
+                        action_affects_display = true;
+                    } else if button == 1 { // Launch volume control app
+                        _ = Command::new(&self.config.volume_control_app).spawn().map_err(|e| eprintln!("Error spawning volume app: {}", e));
+                        // This action itself doesn't require immediate refresh from this block
+                    } else if button == 3 { // Toggle device name display
+                        self.show_device_name = !self.show_device_name;
+                        action_affects_display = true;
+                    }
+
+                    // Perform update if:
+                    // 1. It's the very first update.
+                    // 2. A pactl event occurred (button == 0, meaning a generic change).
+                    // 3. A click action that affects the display was taken.
+                    if first_update || button == 0 || action_affects_display {
+                        match fetch_sink_status() {
+                            Ok(lines) => {
+                                match get_output(get_default_sink_node_name(), lines, self.show_device_name) {
+                                    Ok((line_str, volume_percent)) => {
+                                        // Update stdout if content changed or if it's the first update
+                                        if line_str != self.previous_line || first_update {
+                                            if writeln!(stdout, "{}", line_str).is_err() { self.active = false; break; }
+                                            if io::stdout().flush().is_err() { self.active = false; break; }
+                                            self.previous_line = line_str;
+                                        }
+                                        // Update wob if volume changed (and not the first update)
+                                        if last_volume != volume_percent && !first_update {
+                                            if let Some(wob_stdin_guard) = self.wob_stdin.lock().unwrap().as_mut() {
+                                                let vol_str = format!("{}\n", volume_percent);
+                                                if wob_stdin_guard.write_all(vol_str.as_bytes()).is_err() || wob_stdin_guard.flush().is_err() {
+                                                    eprintln!("Error writing to wob, disabling wob output.");
+                                                    *self.wob_stdin.lock().unwrap() = None; // Stop trying to use wob
+                                                }
+                                            }
+                                        }
+                                        last_volume = volume_percent;
+                                        if first_update { first_update = false; }
+                                    }
+                                    Err(e) => eprintln!("Error getting output: {}", e),
                                 }
                             }
-                            first_update = false;
-                            last_volume = volume_percent;
+                            Err(e) => eprintln!("Error fetching sink status: {}", e),
                         }
                     }
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => { /* Continue loop to check self.active */ }
+                Err(mpsc::RecvTimeoutError::Disconnected) => { self.active = false; break; /* All senders dropped */ }
             }
         }
-        self.active = false;
     }
 
-    pub fn tx(&self) -> Option<Sender<u8>> {
-        if let Ok(ref r1) = &self.sub.lock() {
-            let r2 = r1.as_ref();
-            if let Some(sub) = r2 {
-                let tx = &sub.tx;
-                return Some(tx.clone());
-            }
-        }
-
-        None
+    pub fn tx(&self) -> Sender<u8> {
+        self.event_tx.clone()
     }
 }
 
 impl Drop for Control {
     fn drop(&mut self) {
         self.active = false;
-        if let Some(s) = self.sub.lock().unwrap().take() {
-            _ = s.j.join();
+        // Dropping event_tx will signal sender threads.
+        // Ensure the pactl listener thread is joined.
+        if let Some(jh) = self.pactl_event_thread_handle.lock().unwrap().take() {
+            _ = jh.join().map_err(|e| eprintln!("Error joining pactl_subscribe_listener thread: {:?}", e));
         }
     }
 }
@@ -443,7 +473,7 @@ mod test {
     fn active_output() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -455,7 +485,7 @@ mod test {
     fn no_device_name() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -467,12 +497,19 @@ mod test {
     fn inactive_output() {
         let response = include_str!("../tests/inactive.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true);
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
         assert!(status_line.contains("Creative USB Headset"));
-        assert!(volume == 40);
+        assert_eq!(volume, 40);
+    }
+    #[test]
+    fn empty_sink_list() {
+        let lines: Vec<String> = Vec::new();
+        let (status_line, volume) = get_output(None, lines, false).unwrap();
+        assert!(status_line.is_empty());
+        assert_eq!(volume, 0);
     }
 
     #[test]
@@ -499,7 +536,7 @@ mod test {
     #[test]
     fn test_output() {
         let o = Output{
-            full_text: "full text!",
+            full_text: "full text!".into(),
             ..Default::default()
         };
 
