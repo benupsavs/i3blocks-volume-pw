@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut control = Control::new(config);
     control.subscribe()?;
 
+
     let tx_for_click_listener = control.tx();
 
     let click_listener_thread = thread::Builder::new()
@@ -52,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         break;
                     }
                 }
+
             }
         })?;
 

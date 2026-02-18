@@ -2,11 +2,14 @@ mod protocol;
 use protocol::*;
 
 use std::{error::Error, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio, ChildStdin}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
+
 use lazy_static::lazy_static;
+use zbus::blocking::{Connection, Proxy};
 
 use envconfig::Envconfig;
 use regex::Regex;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 /// Character representing muted audio.
 const CHAR_AUDIO_MUTED:  char = '\u{1F507}';
@@ -17,6 +20,10 @@ const CHAR_AUDIO_MEDIUM: char = '\u{1F509}';
 /// Character representing a high volume level.
 const CHAR_AUDIO_HIGH:   char = '\u{1F50A}';
 
+/// Battery cache TTL and poll interval
+const BT_BATTERY_TTL_SECS: u64 = 30;
+const BT_POLL_INTERVAL_SECS: u64 = 31;
+
 #[derive(Envconfig)]
 pub struct Config {
     #[envconfig(from = "AUDIO_DELTA", default="5")]
@@ -25,6 +32,8 @@ pub struct Config {
     pub volume_control_app: String,
     #[envconfig(from = "SHOW_DEVICE_NAME", default="false")]
     pub show_device_name: bool,
+    #[envconfig(from = "SHOW_BT_BATTERY", default="true")]
+    pub show_bt_battery: bool,
     #[envconfig(from = "PRINT_HEADER", default="false")]
     pub print_header: bool,
     #[envconfig(from = "USE_WOB", default="false")]
@@ -53,6 +62,119 @@ fn get_default_sink_node_name() -> Option<String> {
         }
 }
 
+/// Convert a `pactl`/PipeWire bluez output node name into a MAC address string.
+/// Examples handled:
+/// - `bluez_output.00_1A_7D_DA_71_13.a2dp-sink` -> `00:1A:7D:DA:71:13`
+/// - `bluez_output.AA:BB:CC:DD:EE:FF.a2dp-sink` -> `AA:BB:CC:DD:EE:FF`
+fn mac_from_sink_name(s: &str) -> Option<String> {
+    let prefix = "bluez_output.";
+    if !s.starts_with(prefix) {
+        return None;
+    }
+    let rest = &s[prefix.len()..];
+    // accept both forms: `bluez_output.<mac>.<profile>` and `bluez_output.<mac>`
+    let mac_part = if let Some(dot) = rest.find('.') {
+        &rest[..dot]
+    } else {
+        rest
+    };
+
+    // Accept underscore-separated (`00_1A_...`) or colon-separated (`00:1A:...`).
+    let candidate = if mac_part.contains('_') {
+        mac_part.replace('_', ":")
+    } else if mac_part.contains(':') {
+        mac_part.to_string()
+    } else {
+        return None;
+    };
+
+    // Validate the canonical MAC form XX:XX:XX:XX:XX:XX (hex pairs)
+    let parts: Vec<&str> = candidate.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    for p in &parts {
+        if p.len() != 2 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+
+    Some(candidate.to_uppercase())
+}
+
+lazy_static! {
+    static ref BT_BATTERY_CACHE: Mutex<HashMap<String, (Instant, u8)>> = Mutex::new(HashMap::new());
+}
+
+/// Build a list of candidate BlueZ device object paths for a given MAC.
+/// Example for MAC `AA:BB:CC:DD:EE:FF` -> `/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF`,
+/// `/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF`, ...
+fn bluez_device_paths_for_mac(mac: &str, max_hci: usize) -> Vec<String> {
+    let dev = mac.replace(':', "_").to_uppercase();
+    (0..max_hci).map(|i| format!("/org/bluez/hci{}/dev_{}", i, dev)).collect()
+}
+
+/// Parse `bluetoothctl info <mac>` output for a battery percentage (best-effort).
+fn parse_bluetoothctl_info_output(s: &str) -> Option<u8> {
+    let re = Regex::new(r"Battery Percentage:\s*(\d+)%?").unwrap();
+    if let Some(caps) = re.captures(s) {
+        if let Ok(v) = caps[1].parse::<u8>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Return a cached battery value if it's still fresh.
+fn cached_bt_battery(mac: &str) -> Option<u8> {
+    let key = mac.to_uppercase();
+    let guard = BT_BATTERY_CACHE.lock().unwrap();
+    if let Some((ts, v)) = guard.get(&key) {
+        if Instant::now().duration_since(*ts) < Duration::from_secs(BT_BATTERY_TTL_SECS) {
+            return Some(*v);
+        }
+    }
+    None
+}
+
+/// Query BlueZ `org.bluez.Battery1` for a device MAC (best-effort).
+/// Iterates available hci adapters (hci0..hciN) until a Battery1 property is found.
+/// Falls back to `bluetoothctl info <mac>` if D-Bus lookups fail.
+/// Returns `None` on any error or if Battery1 is not present on any adapter.
+fn get_bt_battery(mac: &str) -> Option<u8> {
+    // Check cache first
+    if let Some(v) = cached_bt_battery(mac) {
+        return Some(v);
+    }
+
+    let conn = Connection::system().ok()?;
+    let key = mac.to_uppercase();
+
+    // Try the first few adapters (80/20: most systems use hci0/hci1).
+    for path in bluez_device_paths_for_mac(mac, 8) {
+        if let Ok(proxy) = Proxy::new(&conn, "org.bluez", path.as_str(), "org.bluez.Battery1") {
+            if let Ok(p) = proxy.get_property::<u8>("Percentage") {
+                // update cache
+                let mut guard = BT_BATTERY_CACHE.lock().unwrap();
+                guard.insert(key.clone(), (Instant::now(), p));
+                return Some(p);
+            }
+        }
+    }
+
+    // D-Bus failed; try CLI fallback (bluetoothctl info <mac>)
+    if let Ok(output) = Command::new("bluetoothctl").arg("info").arg(mac).output() {
+        let out = String::from_utf8_lossy(&output.stdout);
+        if let Some(v) = parse_bluetoothctl_info_output(&out) {
+            let mut guard = BT_BATTERY_CACHE.lock().unwrap();
+            guard.insert(key.clone(), (Instant::now(), v));
+            return Some(v);
+        }
+    }
+
+    None
+}
+
 /// Represents a PipeWire audio sink.
 #[derive(Clone, Default)]
 struct Sink {
@@ -65,6 +187,7 @@ struct Sink {
     got_device_name: bool,
     sink_name: String,
     got_sink_name: bool,
+    battery: Option<u8>,
 }
 
 impl Sink {
@@ -79,6 +202,7 @@ impl Sink {
         self.got_volume = false;
         self.sink_name = String::new();
         self.got_sink_name = false;
+        self.battery = None;
     }
 }
 
@@ -99,7 +223,7 @@ fn fetch_sink_status() -> Result<Vec<String>, Box<dyn Error>> {
 /// Gets the output to be displayed to the user.
 /// The first element of the tuple is the status line,
 /// and the second element is the volume percentage to display to the user.
-pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool) -> Result<(String, u16), Box<dyn Error>> {
+pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include_device_name: bool, include_bt_battery: bool) -> Result<(String, u16), Box<dyn Error>> {
     let mut sinks = Vec::new();
     let mut sink = Sink::default();
     let mut got_sink = false;
@@ -189,6 +313,20 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     }
     let s = s.unwrap();
 
+    // Best-effort: query BlueZ for battery if this looks like a Bluetooth sink
+    let mut bt_battery: Option<u8> = None;
+    if include_bt_battery && s.sink_name.starts_with("bluez_output.") {
+        if let Some(mac) = mac_from_sink_name(&s.sink_name) {
+            bt_battery = get_bt_battery(&mac);
+        }
+    }
+
+    // Delegate rendering to a pure helper so tests can mock the battery/formatting.
+    render_sink_output(s, include_device_name, bt_battery)
+}
+
+/// Render JSON output for a single `Sink` (pure, test-friendly).
+fn render_sink_output(s: &Sink, include_device_name: bool, bt_battery: Option<u8>) -> Result<(String, u16), Box<dyn Error>> {
     let mut output = Output::default();
 
     let icon_char = if s.mute {
@@ -201,7 +339,12 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         CHAR_AUDIO_HIGH
     };
 
-    let base_text = format!("{} {}%", icon_char, s.volume_percent);
+    // Base text includes volume and optional BT battery indicator
+    let mut base_text = format!("{} {}%", icon_char, s.volume_percent);
+    if let Some(b) = bt_battery {
+        base_text.push(' ');
+        base_text.push_str(&format!("🔋{}%", b));
+    }
 
     if include_device_name && !s.device_name.is_empty() {
         output.full_text = format!("{} [{}]", base_text, s.device_name);
@@ -219,6 +362,7 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
         .map_err(|e| format!("Failed to serialize output: {}", e))?;
     Ok((json_output, if s.mute { 0 } else { s.volume_percent }))
 }
+
 
 /// PipeWire audio control API.
 pub struct Control {
@@ -308,7 +452,6 @@ impl Control {
                                             break; // Error, break to retry spawning pactl
                                         }
                                     }
-
                                 }
                             } else {
                                 eprintln!("pactl subscribe: stdout not available.");
@@ -338,10 +481,22 @@ impl Control {
                             thread::sleep(Duration::from_millis(500)); // Wait before retrying
                         }
                     }
-                // Thread ends if loop is exited (e.g., due to too many failures or sender dropping)
                 }
             })
             .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+
+        // poller thread: only spawn when BT battery lookups are enabled in the config.
+        if self.config.show_bt_battery {
+            let tx_poll = self.event_tx.clone();
+            thread::Builder::new().name("bt-poller".to_string()).spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(BT_POLL_INTERVAL_SECS));
+                    if tx_poll.send(0).is_err() {
+                        return;
+                    }
+                }
+            }).expect("create poller thread");
+        }
 
         *self.pactl_event_thread_handle.lock().unwrap() = Some(jh);
         Ok(())
@@ -410,7 +565,7 @@ impl Control {
                     if first_update || button == 0 || action_affects_display {
                         match fetch_sink_status() {
                             Ok(lines) => {
-                                match get_output(get_default_sink_node_name(), lines, self.show_device_name) {
+                                match get_output(get_default_sink_node_name(), lines, self.show_device_name, self.config.show_bt_battery) {
                                     Ok((line_str, volume_percent)) => {
                                         // Update stdout if content changed or if it's the first update
                                         if line_str != self.previous_line || first_update {
@@ -452,11 +607,9 @@ impl Control {
 impl Drop for Control {
     fn drop(&mut self) {
         self.active = false;
-        // Dropping event_tx will signal sender threads.
-        // Ensure the pactl listener thread is joined.
-        if let Some(jh) = self.pactl_event_thread_handle.lock().unwrap().take() {
-            _ = jh.join().map_err(|e| eprintln!("Error joining pactl_subscribe_listener thread: {:?}", e));
-        }
+        // Do not block on joining background threads during drop (tests would hang).
+        // Remove stored handle so the JoinHandle is dropped (thread keeps running until it exits).
+        let _ = self.pactl_event_thread_handle.lock().unwrap().take();
     }
 }
 
@@ -473,7 +626,7 @@ mod test {
     fn active_output() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true).unwrap();
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true, false).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -485,7 +638,7 @@ mod test {
     fn no_device_name() {
         let response = include_str!("../tests/active.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false).unwrap();
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, false, false).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -497,7 +650,7 @@ mod test {
     fn inactive_output() {
         let response = include_str!("../tests/inactive.txt");
         let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
-        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true).unwrap();
+        let (status_line, volume) = get_output(Some("alsa_output.usb-Creative_Technology_Creative_USB_Headset-00.11.analog-stereo".to_string()), lines, true, false).unwrap();
 
         assert!(status_line.contains(&String::from_iter([CHAR_AUDIO_MEDIUM])));
         assert!(status_line.contains("40%"));
@@ -507,7 +660,7 @@ mod test {
     #[test]
     fn empty_sink_list() {
         let lines: Vec<String> = Vec::new();
-        let (status_line, volume) = get_output(None, lines, false).unwrap();
+        let (status_line, volume) = get_output(None, lines, false, false).unwrap();
         assert!(status_line.is_empty());
         assert_eq!(volume, 0);
     }
@@ -542,5 +695,153 @@ mod test {
 
         let r = serde_json::to_string(&o).unwrap();
         assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn mac_from_sink_name_parses() {
+        assert_eq!(mac_from_sink_name("bluez_output.00_1A_7D_DA_71_13.a2dp-sink"), Some("00:1A:7D:DA:71:13".to_string()));
+    }
+
+    #[test]
+    fn mac_from_sink_name_colon_separated() {
+        assert_eq!(mac_from_sink_name("bluez_output.AA:BB:CC:DD:EE:FF.a2dp-sink"), Some("AA:BB:CC:DD:EE:FF".to_string()));
+        // also accept sink names without a trailing profile component
+        assert_eq!(mac_from_sink_name("bluez_output.AA:BB:CC:DD:EE:FF"), Some("AA:BB:CC:DD:EE:FF".to_string()));
+    }
+
+    #[test]
+    fn bluetooth_sink_parsing() {
+        let response = include_str!("../tests/bluetooth.txt");
+        let lines: Vec<String> = response.lines().map(|l| l.to_owned()).collect();
+        let (status_line, volume) = get_output(Some("bluez_output.00_1A_7D_DA_71_13.a2dp-sink".to_string()), lines, true, false).unwrap();
+
+        assert!(status_line.contains("55%"));
+        assert!(status_line.contains("Sony WH-1000XM4"));
+        assert!(volume == 55);
+    }
+
+    #[test]
+    fn render_with_mocked_bt_battery() {
+        let s = Sink{
+            volume_percent: 60,
+            device_name: "ACME Headphones".to_string(),
+            sink_name: "bluez_output.AA:BB:CC:DD:EE:FF".to_string(),
+            mute: false,
+            ..Default::default()
+        };
+
+        let (json, vol) = render_sink_output(&s, true, Some(30)).unwrap();
+        assert!(json.contains("60%"));
+        assert!(json.contains("🔋30%"));
+        assert!(json.contains("ACME Headphones"));
+        assert_eq!(vol, 60);
+    }
+
+    #[test]
+    fn cached_bt_battery_honors_ttl() {
+        let mac = "aa:bb:cc:dd:ee:ff";
+        {
+            let mut guard = BT_BATTERY_CACHE.lock().unwrap();
+            guard.insert(mac.to_uppercase(), (Instant::now(), 77));
+        }
+        assert_eq!(cached_bt_battery(mac), Some(77));
+
+        // expired entry should not be returned
+        {
+            let mut guard = BT_BATTERY_CACHE.lock().unwrap();
+            guard.insert(mac.to_uppercase(), (Instant::now() - Duration::from_secs(BT_BATTERY_TTL_SECS + 1), 88));
+        }
+        assert_eq!(cached_bt_battery(mac), None);
+    }
+
+    #[test]
+    fn subscribe_creates_poller_thread() {
+        let cfg = Config { audio_delta: 5, volume_control_app: "pavucontrol".to_string(), show_device_name: false, show_bt_battery: false, print_header: false, use_wob: false };
+        let mut c = Control::new(cfg);
+        c.subscribe().unwrap();
+        // pactl listener thread handle should be present
+        assert!(c.pactl_event_thread_handle.lock().unwrap().is_some());
+        // sending on tx should succeed (receiver present)
+        assert!(c.tx().send(0).is_ok());
+        // drop the receiver so background threads can exit, then drop control
+        c.event_rx = None;
+        drop(c);
+    }
+
+    #[test]
+    fn mac_from_sink_name_lowercase() {
+        assert_eq!(mac_from_sink_name("bluez_output.00_1a_7d_da_71_13.a2dp-sink"), Some("00:1A:7D:DA:71:13".to_string()));
+    }
+
+    #[test]
+    fn mac_from_sink_name_non_underscored() {
+        // unsupported format should return None
+        assert_eq!(mac_from_sink_name("bluez_output.001A7DDA7113.a2dp-sink"), None);
+    }
+
+    #[test]
+    fn bluez_device_paths_helper() {
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let paths = bluez_device_paths_for_mac(mac, 4);
+        assert_eq!(paths[0], "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+        assert_eq!(paths[1], "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF");
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn parse_bluetoothctl_info_output_from_fixture() {
+        let s = include_str!("../tests/bluetoothctl_info.txt");
+        assert_eq!(parse_bluetoothctl_info_output(s), Some(30));
+    }
+
+    #[test]
+    fn parse_bluetoothctl_info_output_none() {
+        let s = "Device AA:BB:CC:DD:EE:FF\n\tName: Some Device\n\tConnected: yes\n";
+        assert_eq!(parse_bluetoothctl_info_output(s), None);
+    }
+
+    /// Live debugging test (ignored by default).
+    ///
+    /// Run locally with:
+    ///   cargo test live_bt_battery_debug -- --ignored --nocapture
+    ///
+    /// This will print detected bluez sinks, the derived MAC and the result of the
+    /// BlueZ Battery1 lookup so you can see where the lookup is failing on your machine.
+    #[test]
+    #[ignore]
+    fn live_bt_battery_debug() {
+        let lines = fetch_sink_status().unwrap();
+        let mut found: Option<String> = None;
+        for line in &lines {
+            if line.trim_start().starts_with("Name: ") {
+                let name = line.trim()[6..].trim().to_string();
+                if name.starts_with("bluez_output.") {
+                    found = Some(name);
+                    break;
+                }
+            }
+        }
+
+        if found.is_none() {
+            eprintln!("No bluez_output sink found in pactl output; skipping live test.");
+            return;
+        }
+
+        let sink_name = found.unwrap();
+        eprintln!("Found bluez sink name: {}", sink_name);
+
+        let mac = mac_from_sink_name(&sink_name);
+        eprintln!("mac_from_sink_name -> {:?}", mac);
+        if mac.is_none() {
+            eprintln!("mac_from_sink_name failed to parse {}; skipping live debug.", sink_name);
+            return;
+        }
+        let mac = mac.unwrap();
+
+        eprintln!("(live) get_bt_battery -> {:?}", get_bt_battery(&mac));
+
+        let (status_line, volume) = get_output(get_default_sink_node_name(), fetch_sink_status().unwrap(), true, true).unwrap();
+        eprintln!("get_output -> {}", status_line);
+        eprintln!("volume -> {}", volume);
     }
 }

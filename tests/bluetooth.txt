@@ -1,0 +1,27 @@
+Sink #6000
+	State: RUNNING
+	Name: bluez_output.00_1A_7D_DA_71_13.a2dp-sink
+	Description: WH-1000XM4 (A2DP)
+	Driver: PipeWire
+	Sample Specification: s24le 2ch 48000Hz
+	Channel Map: front-left,front-right
+	Owner Module: 4294967295
+	Mute: no
+	Volume: front-left: 36044 /  55% / -6.00 dB,   front-right: 36044 /  55% / -6.00 dB
+		balance 0.00
+	Base Volume: 65536 / 100% / 0.00 dB
+	Monitor Source: bluez_output.00_1A_7D_DA_71_13.a2dp-sink.monitor
+	Latency: 0 usec, configured 0 usec
+	Flags: HARDWARE HW_MUTE_CTRL HW_VOLUME_CTRL DECIBEL_VOLUME LATENCY
+	Properties:
+		node.name = "bluez_output.00_1A_7D_DA_71_13.a2dp-sink"
+		node.nick = "Sony WH-1000XM4"
+		device.alias = "Sony WH-1000XM4"
+		device.string = "bluez_output.00_1A_7D_DA_71_13.a2dp-sink"
+		audio.channels = "2"
+		audio.position = "FL,FR"
+	Ports:
+		[Out] a2dp-sink: A2DP Sink (type: Headphones, priority: 9900, available)
+	Active Port: [Out] a2dp-sink
+	Formats:
+		pcm
