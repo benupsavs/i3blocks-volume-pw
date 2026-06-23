@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{error::Error, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio, ChildStdin}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
+use std::{error::Error, io::{self, BufRead, BufReader, Read, Write}, process::{Command, Stdio, ChildStdin}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
 
 use lazy_static::lazy_static;
 use zbus::blocking::{Connection, Proxy};
@@ -162,9 +162,9 @@ fn get_bt_battery(mac: &str) -> Option<u8> {
         }
     }
 
-    // D-Bus failed; try CLI fallback (bluetoothctl info <mac>)
-    if let Ok(output) = Command::new("bluetoothctl").arg("info").arg(mac).output() {
-        let out = String::from_utf8_lossy(&output.stdout);
+    // D-Bus failed; try CLI fallback (bluetoothctl info <mac>) with a timeout so a
+    // hung BlueZ stack can't wedge the caller indefinitely.
+    if let Some(out) = bluetoothctl_info_with_timeout(mac, Duration::from_secs(5)) {
         if let Some(v) = parse_bluetoothctl_info_output(&out) {
             let mut guard = BT_BATTERY_CACHE.lock().unwrap();
             guard.insert(key.clone(), (Instant::now(), v));
@@ -172,6 +172,55 @@ fn get_bt_battery(mac: &str) -> Option<u8> {
         }
     }
 
+    None
+}
+
+/// Run `bluetoothctl info <mac>` but give up after `timeout`, returning its stdout
+/// (or `None` on spawn failure / timeout). The child keeps running detached if it
+/// overruns, but we stop waiting so the caller never blocks longer than `timeout`.
+fn bluetoothctl_info_with_timeout(mac: &str, timeout: Duration) -> Option<String> {
+    let mut child = Command::new("bluetoothctl")
+        .arg("info")
+        .arg(mac)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let (tx, rx) = mpsc::channel();
+    let mut stdout = child.stdout.take()?;
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(buf) => {
+            let _ = child.wait();
+            Some(buf)
+        }
+        Err(_) => {
+            // Timed out: kill the child so it doesn't linger.
+            let _ = child.kill();
+            None
+        }
+    }
+}
+
+/// Find the MAC of the first Bluetooth sink present in `pactl list sinks` output.
+fn bluez_mac_from_lines(lines: &[String]) -> Option<String> {
+    for line in lines {
+        if let Some(caps) = RE_SINK_NAME.captures(line.trim_end()) {
+            let name = &caps[1];
+            if name.starts_with("bluez_output.") {
+                if let Some(mac) = mac_from_sink_name(name) {
+                    return Some(mac);
+                }
+            }
+        }
+    }
     None
 }
 
@@ -313,11 +362,13 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     }
     let s = s.unwrap();
 
-    // Best-effort: query BlueZ for battery if this looks like a Bluetooth sink
+    // Best-effort: read a cached BlueZ battery value if this looks like a Bluetooth
+    // sink. The actual (potentially blocking) D-Bus/bluetoothctl lookup happens on
+    // the bt-poller thread, never here on the event loop.
     let mut bt_battery: Option<u8> = None;
     if include_bt_battery && s.sink_name.starts_with("bluez_output.") {
         if let Some(mac) = mac_from_sink_name(&s.sink_name) {
-            bt_battery = get_bt_battery(&mac);
+            bt_battery = cached_bt_battery(&mac);
         }
     }
 
@@ -393,7 +444,7 @@ impl Control {
     }
 
     /// Adjusts the volume by the given amount. Negative values request lowering the volume.
-    pub fn adjust_volume(&self, delta: i8) -> Result<(), Box<dyn Error>> {
+    pub fn adjust_volume(&self, delta: i32) -> Result<(), Box<dyn Error>> {
         if delta == 0 {
             return Ok(())
         }
@@ -486,14 +537,22 @@ impl Control {
             .map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
         // poller thread: only spawn when BT battery lookups are enabled in the config.
+        // It performs the (potentially blocking) battery lookup here, off the event
+        // loop, then signals a refresh so the freshly cached value gets displayed.
         if self.config.show_bt_battery {
             let tx_poll = self.event_tx.clone();
             thread::Builder::new().name("bt-poller".to_string()).spawn(move || {
                 loop {
-                    thread::sleep(Duration::from_secs(BT_POLL_INTERVAL_SECS));
+                    if let Ok(lines) = fetch_sink_status() {
+                        if let Some(mac) = bluez_mac_from_lines(&lines) {
+                            // Warms BT_BATTERY_CACHE; get_output only reads the cache.
+                            let _ = get_bt_battery(&mac);
+                        }
+                    }
                     if tx_poll.send(0).is_err() {
                         return;
                     }
+                    thread::sleep(Duration::from_secs(BT_POLL_INTERVAL_SECS));
                 }
             }).expect("create poller thread");
         }
@@ -537,64 +596,86 @@ impl Control {
         let mut last_volume = 0u16;
 
         while self.active {
-            match event_rx.recv_timeout(Duration::from_secs(1)) { // Use recv_timeout to periodically check self.active
-                Ok(button) => {
-                    let mut action_affects_display = false;
+            // Block for the first event (with a 1s timeout so we can re-check active).
+            let first = match event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(b) => b,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => { self.active = false; break; }
+            };
 
-                    if button == 2 { // Mute toggle
-                        _ = self.toggle_mute().map_err(|e| eprintln!("Error toggling mute: {}", e));
-                        action_affects_display = true;
-                    } else if button == 4 { // Volume up
-                        _ = self.adjust_volume(self.config.audio_delta as i8).map_err(|e| eprintln!("Error adjusting volume up: {}", e));
-                        action_affects_display = true;
-                    } else if button == 5 { // Volume down
-                        _ = self.adjust_volume(-(self.config.audio_delta as i8)).map_err(|e| eprintln!("Error adjusting volume down: {}", e));
-                        action_affects_display = true;
-                    } else if button == 1 { // Launch volume control app
-                        _ = Command::new(&self.config.volume_control_app).spawn().map_err(|e| eprintln!("Error spawning volume app: {}", e));
-                        // This action itself doesn't require immediate refresh from this block
-                    } else if button == 3 { // Toggle device name display
-                        self.show_device_name = !self.show_device_name;
-                        action_affects_display = true;
-                    }
+            // Coalesce the whole burst that's already queued: net the volume deltas,
+            // collapse repeated mute / name toggles, and refresh display only once.
+            let mut net_volume: i32 = 0;
+            let mut mute_toggles: u32 = 0;
+            let mut name_toggles: u32 = 0;
+            let mut launch_app = false;
+            let mut generic_change = false;
 
-                    // Perform update if:
-                    // 1. It's the very first update.
-                    // 2. A pactl event occurred (button == 0, meaning a generic change).
-                    // 3. A click action that affects the display was taken.
-                    if first_update || button == 0 || action_affects_display {
-                        match fetch_sink_status() {
-                            Ok(lines) => {
-                                match get_output(get_default_sink_node_name(), lines, self.show_device_name, self.config.show_bt_battery) {
-                                    Ok((line_str, volume_percent)) => {
-                                        // Update stdout if content changed or if it's the first update
-                                        if line_str != self.previous_line || first_update {
-                                            if writeln!(stdout, "{}", line_str).is_err() { self.active = false; break; }
-                                            if io::stdout().flush().is_err() { self.active = false; break; }
-                                            self.previous_line = line_str;
-                                        }
-                                        // Update wob if volume changed (and not the first update)
-                                        if last_volume != volume_percent && !first_update {
-                                            if let Some(wob_stdin_guard) = self.wob_stdin.lock().unwrap().as_mut() {
-                                                let vol_str = format!("{}\n", volume_percent);
-                                                if wob_stdin_guard.write_all(vol_str.as_bytes()).is_err() || wob_stdin_guard.flush().is_err() {
-                                                    eprintln!("Error writing to wob, disabling wob output.");
-                                                    *self.wob_stdin.lock().unwrap() = None; // Stop trying to use wob
-                                                }
-                                            }
-                                        }
-                                        last_volume = volume_percent;
-                                        if first_update { first_update = false; }
-                                    }
-                                    Err(e) => eprintln!("Error getting output: {}", e),
+            let mut absorb = |button: u8| match button {
+                0 => generic_change = true,                          // pactl/poller change
+                1 => launch_app = true,                              // launch volume app
+                2 => mute_toggles += 1,                              // mute toggle
+                3 => name_toggles += 1,                              // toggle device name
+                4 => net_volume += self.config.audio_delta as i32,   // volume up
+                5 => net_volume -= self.config.audio_delta as i32,   // volume down
+                _ => {}
+            };
+            absorb(first);
+            while let Ok(b) = event_rx.try_recv() {
+                absorb(b);
+            }
+
+            // Apply the netted actions, each at most once.
+            let mut action_affects_display = false;
+            if mute_toggles % 2 == 1 {
+                _ = self.toggle_mute().map_err(|e| eprintln!("Error toggling mute: {}", e));
+                action_affects_display = true;
+            }
+            if net_volume != 0 {
+                _ = self.adjust_volume(net_volume).map_err(|e| eprintln!("Error adjusting volume: {}", e));
+                action_affects_display = true;
+            }
+            if name_toggles % 2 == 1 {
+                self.show_device_name = !self.show_device_name;
+                action_affects_display = true;
+            }
+            if launch_app {
+                _ = Command::new(&self.config.volume_control_app).spawn().map_err(|e| eprintln!("Error spawning volume app: {}", e));
+            }
+
+            // Perform update if:
+            // 1. It's the very first update.
+            // 2. A pactl/poller change event occurred.
+            // 3. A click action that affects the display was taken.
+            if first_update || generic_change || action_affects_display {
+                match fetch_sink_status() {
+                    Ok(lines) => {
+                        match get_output(get_default_sink_node_name(), lines, self.show_device_name, self.config.show_bt_battery) {
+                            Ok((line_str, volume_percent)) => {
+                                // Update stdout if content changed or if it's the first update
+                                if line_str != self.previous_line || first_update {
+                                    if writeln!(stdout, "{}", line_str).is_err() { self.active = false; break; }
+                                    if io::stdout().flush().is_err() { self.active = false; break; }
+                                    self.previous_line = line_str;
                                 }
+                                // Update wob if volume changed (and not the first update)
+                                if last_volume != volume_percent && !first_update {
+                                    if let Some(wob_stdin_guard) = self.wob_stdin.lock().unwrap().as_mut() {
+                                        let vol_str = format!("{}\n", volume_percent);
+                                        if wob_stdin_guard.write_all(vol_str.as_bytes()).is_err() || wob_stdin_guard.flush().is_err() {
+                                            eprintln!("Error writing to wob, disabling wob output.");
+                                            *self.wob_stdin.lock().unwrap() = None; // Stop trying to use wob
+                                        }
+                                    }
+                                }
+                                last_volume = volume_percent;
+                                if first_update { first_update = false; }
                             }
-                            Err(e) => eprintln!("Error fetching sink status: {}", e),
+                            Err(e) => eprintln!("Error getting output: {}", e),
                         }
                     }
+                    Err(e) => eprintln!("Error fetching sink status: {}", e),
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => { /* Continue loop to check self.active */ }
-                Err(mpsc::RecvTimeoutError::Disconnected) => { self.active = false; break; /* All senders dropped */ }
             }
         }
     }
