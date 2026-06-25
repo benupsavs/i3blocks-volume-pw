@@ -489,7 +489,7 @@ impl Control {
                                     match reader.read_line(&mut line) {
                                         Ok(0) => break, // EOF, pactl exited
                                         Ok(_) => {
-                                            if line.contains("change") {
+                                            if line.contains("change") && !line.contains("on client") {
                                                 if tx_for_pactl_thread.send(0).is_err() {
                                                     // Receiver is gone, main loop likely exited
                                                     _ = child.wait(); // Ensure child process is cleaned up
