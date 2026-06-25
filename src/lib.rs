@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{error::Error, io::{self, Write}, process::{Command, Stdio, ChildStdin}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread, rc::Rc, cell::RefCell, os::unix::io::RawFd};
+use std::{error::Error, io::{self, Write}, process::{Command, Stdio, ChildStdin}, sync::{Arc, Mutex}, thread, rc::Rc, cell::{Cell, RefCell}, os::unix::io::RawFd};
 
 use lazy_static::lazy_static;
 use zbus::blocking::{Connection, Proxy};
@@ -16,6 +16,8 @@ use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
 use pulse::context::subscribe::InterestMaskSet;
 use pulse::context::introspect::SinkInfo;
 use pulse::mainloop::standard::{Mainloop, IterateResult};
+use pulse::mainloop::api::Mainloop as _; // trait providing new_io_event()
+use pulse::mainloop::events::io::FlagSet as IoFlagSet;
 use pulse::callbacks::ListResult;
 use pulse::volume::{ChannelVolumes, Volume};
 use pulse::def::SinkState;
@@ -32,10 +34,6 @@ const CHAR_AUDIO_HIGH:   char = '\u{1F50A}';
 /// Battery cache TTL and poll interval
 const BT_BATTERY_TTL_SECS: u64 = 30;
 const BT_POLL_INTERVAL_SECS: u64 = 31;
-
-/// How long the event loop sleeps between non-blocking mainloop iterations.
-/// This bounds idle wakeups (~20/s) while keeping click latency imperceptible.
-const TICK: Duration = Duration::from_millis(50);
 
 #[derive(Envconfig)]
 pub struct Config {
@@ -432,7 +430,10 @@ impl Control {
         Self { config }
     }
 
-    /// Run the blocklet event loop. Blocks until stdin closes or the connection dies.
+    /// Run the blocklet event loop. Fully event-driven: the process blocks in
+    /// `poll()` (zero CPU) until the PulseAudio socket, stdin (clicks), or the
+    /// battery-poller wakeup pipe becomes readable. Returns when stdin closes or
+    /// the connection dies.
     pub fn run(self) -> Result<(), Box<dyn Error>> {
         // Optional i3bar protocol header.
         if self.config.print_header {
@@ -452,18 +453,22 @@ impl Control {
 
         let current_bluez_mac: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-        // Background Bluetooth battery poller: warms BT_BATTERY_CACHE off the event
-        // loop (the D-Bus / bluetoothctl lookup may block), then flags a redraw.
-        let bt_dirty = Arc::new(AtomicBool::new(false));
+        // Self-pipe so the (blocking) Bluetooth battery thread can wake the event
+        // loop: it writes a byte after warming the cache, the read end is polled as
+        // an IO event source, and its callback triggers a redraw.
+        let (bt_pipe_rd, bt_pipe_wr) = make_pipe()?;
+        set_nonblocking(bt_pipe_rd);
+
+        // Background Bluetooth battery poller: the D-Bus / bluetoothctl lookup may
+        // block, so it runs off the event loop and signals via the pipe.
         if self.config.show_bt_battery {
             let mac_slot = current_bluez_mac.clone();
-            let dirty = bt_dirty.clone();
             thread::Builder::new().name("bt-poller".to_string()).spawn(move || {
                 loop {
                     let mac = mac_slot.lock().unwrap().clone();
                     if let Some(mac) = mac {
                         if get_bt_battery(&mac).is_some() {
-                            dirty.store(true, Ordering::SeqCst);
+                            let _ = unsafe { libc::write(bt_pipe_wr, [1u8].as_ptr() as *const libc::c_void, 1) };
                         }
                     }
                     thread::sleep(Duration::from_secs(BT_POLL_INTERVAL_SECS));
@@ -510,92 +515,120 @@ impl Control {
         // --- Subscribe to sink and server changes ---
         // Only SINK | SERVER: nothing here reacts to client events, so our own
         // introspection queries can never re-trigger a refresh.
-        let dirty = Rc::new(std::cell::Cell::new(true)); // true => render once at startup
         {
-            let dirty_cb = dirty.clone();
+            let ctx_sub = ctx.clone();
+            let state_sub = state.clone();
             ctx.borrow_mut().set_subscribe_callback(Some(Box::new(move |_facility, _op, _idx| {
-                dirty_cb.set(true);
+                request_redraw(&ctx_sub, &state_sub);
             })));
             ctx.borrow_mut().subscribe(InterestMaskSet::SINK | InterestMaskSet::SERVER, |_| {});
         }
 
-        // Put stdin into non-blocking mode so we can poll clicks without blocking
-        // the event loop.
+        // Set to true by the stdin callback on EOF (parent closed); checked after
+        // each blocking iteration to exit the loop.
+        let quit = Rc::new(Cell::new(false));
+
+        // --- stdin (clicks) as an IO event source ---
         set_nonblocking(0);
-        let mut stdin_acc: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 1024];
-
-        // --- Event loop ---
-        loop {
-            match mainloop.iterate(false) {
-                IterateResult::Success(_) => {}
-                IterateResult::Quit(_) | IterateResult::Err(_) => break,
-            }
-
-            // Drain any pending click input.
-            let mut eof = false;
-            loop {
-                let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if n > 0 {
-                    stdin_acc.extend_from_slice(&buf[..n as usize]);
-                } else if n == 0 {
-                    eof = true; // parent closed stdin
-                    break;
-                } else {
-                    break; // EAGAIN / no more data
+        let stdin_ev = {
+            let ctx_c = ctx.clone();
+            let state_c = state.clone();
+            let quit_c = quit.clone();
+            let app = self.config.volume_control_app.clone();
+            let delta = self.config.audio_delta as i32;
+            let mut acc: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 1024];
+            mainloop.new_io_event(0, IoFlagSet::INPUT, Box::new(move |mut ev, _fd, _flags| {
+                loop {
+                    let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                    if n > 0 {
+                        acc.extend_from_slice(&buf[..n as usize]);
+                    } else if n == 0 {
+                        // EOF: parent gone. Stop listening and ask the loop to quit.
+                        quit_c.set(true);
+                        ev.enable(IoFlagSet::NULL);
+                        return;
+                    } else {
+                        break; // EAGAIN
+                    }
                 }
-            }
-            while let Some(pos) = stdin_acc.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = stdin_acc.drain(..=pos).collect();
-                let text = String::from_utf8_lossy(&line);
-                self.handle_click_line(text.trim(), &ctx, &state, &dirty);
-            }
-            if eof { break; }
-
-            // Battery thread asked for a redraw.
-            if bt_dirty.swap(false, Ordering::SeqCst) {
-                dirty.set(true);
-            }
-
-            // Redraw if anything changed.
-            if dirty.replace(false) {
-                request_redraw(&ctx, &state);
-            }
-
-            thread::sleep(TICK);
-        }
-
-        Ok(())
-    }
-
-    /// Handle one line of i3bar click JSON. Lines that don't parse as a click are
-    /// treated as a generic refresh request (matches the prior behaviour).
-    fn handle_click_line(&self, text: &str, ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>, dirty: &Rc<std::cell::Cell<bool>>) {
-        if text.is_empty() {
-            return;
-        }
-        let button = match parse_click(text) {
-            Ok(click) => click.button,
-            Err(_) => { dirty.set(true); return; } // non-click line: refresh
+                while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    let text = String::from_utf8_lossy(&line);
+                    handle_click(text.trim(), &ctx_c, &state_c, &app, delta);
+                }
+            }))
         };
-        match button {
-            1 => {
-                if let Err(e) = Command::new(&self.config.volume_control_app).spawn() {
-                    eprintln!("Error spawning volume app: {}", e);
-                }
+
+        // --- battery-poller wakeup pipe as an IO event source ---
+        let bt_ev = {
+            let ctx_p = ctx.clone();
+            let state_p = state.clone();
+            let mut drain = [0u8; 64];
+            mainloop.new_io_event(bt_pipe_rd, IoFlagSet::INPUT, Box::new(move |_ev, _fd, _flags| {
+                while unsafe { libc::read(bt_pipe_rd, drain.as_mut_ptr() as *mut libc::c_void, drain.len()) } > 0 {}
+                request_redraw(&ctx_p, &state_p);
+            }))
+        };
+
+        // Render once at startup, then sleep until something actually happens.
+        request_redraw(&ctx, &state);
+        let result = loop {
+            match mainloop.iterate(true) {
+                IterateResult::Success(_) => {}
+                IterateResult::Quit(_) | IterateResult::Err(_) => break Ok(()),
             }
-            2 => set_mute_toggle(ctx, state),
-            3 => {
+            if quit.get() {
+                break Ok(());
+            }
+        };
+
+        // Keep the event sources alive for the whole loop.
+        drop(stdin_ev);
+        drop(bt_ev);
+        result
+    }
+}
+
+/// Handle one line of i3bar click JSON. Lines that don't parse as a click are
+/// treated as a generic refresh request (matches the prior behaviour). Volume and
+/// mute actions are fire-and-forget; the resulting sink-change event drives the
+/// redraw, while local-only changes (device-name toggle) redraw directly.
+fn handle_click(text: &str, ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>, volume_app: &str, delta: i32) {
+    if text.is_empty() {
+        return;
+    }
+    let button = match parse_click(text) {
+        Ok(click) => click.button,
+        Err(_) => { request_redraw(ctx, state); return; }
+    };
+    match button {
+        1 => {
+            if let Err(e) = Command::new(volume_app).spawn() {
+                eprintln!("Error spawning volume app: {}", e);
+            }
+        }
+        2 => set_mute_toggle(ctx, state),
+        3 => {
+            {
                 let mut s = state.borrow_mut();
                 s.show_device_name = !s.show_device_name;
-                drop(s);
-                dirty.set(true);
             }
-            4 => adjust_volume(ctx, state, self.config.audio_delta as i32),
-            5 => adjust_volume(ctx, state, -(self.config.audio_delta as i32)),
-            _ => dirty.set(true),
+            request_redraw(ctx, state);
         }
+        4 => adjust_volume(ctx, state, delta),
+        5 => adjust_volume(ctx, state, -delta),
+        _ => request_redraw(ctx, state),
     }
+}
+
+/// Create a pipe, returning (read_fd, write_fd).
+fn make_pipe() -> Result<(RawFd, RawFd), Box<dyn Error>> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err("failed to create wakeup pipe".into());
+    }
+    Ok((fds[0], fds[1]))
 }
 
 /// Apply a relative volume change (in percent) to the current sink.
