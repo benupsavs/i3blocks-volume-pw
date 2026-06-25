@@ -430,10 +430,10 @@ impl Control {
         Self { config }
     }
 
-    /// Run the blocklet event loop. Fully event-driven: the process blocks in
-    /// `poll()` (zero CPU) until the PulseAudio socket, stdin (clicks), or the
-    /// battery-poller wakeup pipe becomes readable. Returns when stdin closes or
-    /// the connection dies.
+    /// Run the blocklet. Fully event-driven: the process blocks in `poll()` (zero
+    /// CPU) until the PulseAudio socket, stdin (clicks), or the battery-poller
+    /// wakeup pipe becomes readable. Reconnects automatically if the server
+    /// restarts, and returns only when stdin closes (the parent goes away).
     pub fn run(self) -> Result<(), Box<dyn Error>> {
         // Optional i3bar protocol header.
         if self.config.print_header {
@@ -455,7 +455,8 @@ impl Control {
 
         // Self-pipe so the (blocking) Bluetooth battery thread can wake the event
         // loop: it writes a byte after warming the cache, the read end is polled as
-        // an IO event source, and its callback triggers a redraw.
+        // an IO event source, and its callback triggers a redraw. Created once and
+        // reused across reconnects (it is independent of the server connection).
         let (bt_pipe_rd, bt_pipe_wr) = make_pipe()?;
         set_nonblocking(bt_pipe_rd);
 
@@ -476,6 +477,8 @@ impl Control {
             })?;
         }
 
+        // Display/runtime state persists across reconnects so the bar keeps showing
+        // the last value through a brief server restart.
         let state = Rc::new(RefCell::new(State {
             show_device_name: self.config.show_device_name,
             show_bt_battery: self.config.show_bt_battery,
@@ -490,31 +493,58 @@ impl Control {
             current_bluez_mac,
         }));
 
-        // --- Connect to the server ---
-        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
-        let ctx = Rc::new(RefCell::new(
-            Context::new(&mainloop, "i3blocks-volume-pw").ok_or("failed to create PulseAudio context")?
-        ));
-        ctx.borrow_mut().connect(None, ContextFlagSet::NOFLAGS, None)?;
+        // Set by the stdin callback on EOF (parent closed); a real, permanent exit.
+        let quit = Rc::new(Cell::new(false));
 
-        // Block until the context is ready (or fails).
+        set_nonblocking(0);
+
+        // Reconnect loop: each session owns a fresh mainloop/context. Backoff grows
+        // on repeated failures (e.g. server still down) and resets once connected.
+        let mut delay = Duration::from_millis(200);
+        let max_delay = Duration::from_secs(2);
+        loop {
+            match self.run_session(&state, &quit, bt_pipe_rd, &mut delay) {
+                SessionEnd::Eof => return Ok(()),
+                SessionEnd::Lost => {
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(max_delay);
+                }
+            }
+        }
+    }
+
+    /// Run a single connected session until the parent closes stdin (`Eof`) or the
+    /// server connection is lost (`Lost`). On a successful connect, `delay` is reset
+    /// to its minimum so the next disconnect retries promptly.
+    fn run_session(&self, state: &Rc<RefCell<State>>, quit: &Rc<Cell<bool>>, bt_pipe_rd: RawFd, delay: &mut Duration) -> SessionEnd {
+        let mut mainloop = match Mainloop::new() {
+            Some(m) => m,
+            None => return SessionEnd::Lost,
+        };
+        let ctx = match Context::new(&mainloop, "i3blocks-volume-pw") {
+            Some(c) => Rc::new(RefCell::new(c)),
+            None => return SessionEnd::Lost,
+        };
+        if ctx.borrow_mut().connect(None, ContextFlagSet::NOFLAGS, None).is_err() {
+            return SessionEnd::Lost;
+        }
+
+        // Wait for the context to become ready (or fail).
         loop {
             match mainloop.iterate(true) {
                 IterateResult::Success(_) => {}
-                IterateResult::Quit(_) | IterateResult::Err(_) =>
-                    return Err("PulseAudio mainloop quit during connect".into()),
+                IterateResult::Quit(_) | IterateResult::Err(_) => return SessionEnd::Lost,
             }
             match ctx.borrow().get_state() {
                 ContextState::Ready => break,
-                ContextState::Failed | ContextState::Terminated =>
-                    return Err("PulseAudio connection failed".into()),
+                ContextState::Failed | ContextState::Terminated => return SessionEnd::Lost,
                 _ => {}
             }
         }
+        *delay = Duration::from_millis(200); // connected: reset backoff
 
-        // --- Subscribe to sink and server changes ---
-        // Only SINK | SERVER: nothing here reacts to client events, so our own
-        // introspection queries can never re-trigger a refresh.
+        // Subscribe to sink and server changes only. Nothing reacts to client
+        // events, so our own introspection queries can never re-trigger a refresh.
         {
             let ctx_sub = ctx.clone();
             let state_sub = state.clone();
@@ -524,12 +554,7 @@ impl Control {
             ctx.borrow_mut().subscribe(InterestMaskSet::SINK | InterestMaskSet::SERVER, |_| {});
         }
 
-        // Set to true by the stdin callback on EOF (parent closed); checked after
-        // each blocking iteration to exit the loop.
-        let quit = Rc::new(Cell::new(false));
-
-        // --- stdin (clicks) as an IO event source ---
-        set_nonblocking(0);
+        // stdin (clicks) as an IO event source.
         let stdin_ev = {
             let ctx_c = ctx.clone();
             let state_c = state.clone();
@@ -560,7 +585,7 @@ impl Control {
             }))
         };
 
-        // --- battery-poller wakeup pipe as an IO event source ---
+        // battery-poller wakeup pipe as an IO event source.
         let bt_ev = {
             let ctx_p = ctx.clone();
             let state_p = state.clone();
@@ -571,23 +596,37 @@ impl Control {
             }))
         };
 
-        // Render once at startup, then sleep until something actually happens.
-        request_redraw(&ctx, &state);
-        let result = loop {
+        // Render once, then sleep until something actually happens.
+        request_redraw(&ctx, state);
+        let outcome = loop {
             match mainloop.iterate(true) {
                 IterateResult::Success(_) => {}
-                IterateResult::Quit(_) | IterateResult::Err(_) => break Ok(()),
+                IterateResult::Quit(_) | IterateResult::Err(_) => break SessionEnd::Lost,
             }
             if quit.get() {
-                break Ok(());
+                break SessionEnd::Eof;
+            }
+            // A server restart leaves iterate() returning Success but the context
+            // Failed/Terminated; detect it here and reconnect.
+            match ctx.borrow().get_state() {
+                ContextState::Ready => {}
+                _ => break SessionEnd::Lost,
             }
         };
 
-        // Keep the event sources alive for the whole loop.
+        // Keep the event sources alive for the whole session.
         drop(stdin_ev);
         drop(bt_ev);
-        result
+        outcome
     }
+}
+
+/// Why a session ended.
+enum SessionEnd {
+    /// stdin closed — the parent process is gone; exit for good.
+    Eof,
+    /// The server connection was lost — reconnect.
+    Lost,
 }
 
 /// Handle one line of i3bar click JSON. Lines that don't parse as a click are
