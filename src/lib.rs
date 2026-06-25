@@ -1,7 +1,7 @@
 mod protocol;
 use protocol::*;
 
-use std::{error::Error, io::{self, BufRead, BufReader, Read, Write}, process::{Command, Stdio, ChildStdin}, sync::{mpsc::{self, Receiver, Sender}, Mutex}, thread::{self, JoinHandle}};
+use std::{error::Error, io::{self, Write}, process::{Command, Stdio, ChildStdin}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread, rc::Rc, cell::RefCell, os::unix::io::RawFd};
 
 use lazy_static::lazy_static;
 use zbus::blocking::{Connection, Proxy};
@@ -10,6 +10,15 @@ use envconfig::Envconfig;
 use regex::Regex;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+
+use libpulse_binding as pulse;
+use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use pulse::context::subscribe::InterestMaskSet;
+use pulse::context::introspect::SinkInfo;
+use pulse::mainloop::standard::{Mainloop, IterateResult};
+use pulse::callbacks::ListResult;
+use pulse::volume::{ChannelVolumes, Volume};
+use pulse::def::SinkState;
 
 /// Character representing muted audio.
 const CHAR_AUDIO_MUTED:  char = '\u{1F507}';
@@ -23,6 +32,10 @@ const CHAR_AUDIO_HIGH:   char = '\u{1F50A}';
 /// Battery cache TTL and poll interval
 const BT_BATTERY_TTL_SECS: u64 = 30;
 const BT_POLL_INTERVAL_SECS: u64 = 31;
+
+/// How long the event loop sleeps between non-blocking mainloop iterations.
+/// This bounds idle wakeups (~20/s) while keeping click latency imperceptible.
+const TICK: Duration = Duration::from_millis(50);
 
 #[derive(Envconfig)]
 pub struct Config {
@@ -47,19 +60,6 @@ lazy_static! {
     static ref RE_DEVICE_NAME_1: Regex = Regex::new(r#"^\t\tnode\.nick\s=\s"([^"]+?)""#).unwrap();
     static ref RE_DEVICE_NAME_2: Regex = Regex::new(r#"^\t\tdevice\.alias\s=\s"([^"]+?)""#).unwrap();
     static ref RE_SINK_NAME: Regex = Regex::new(r#"^\tName: (.+)$"#).unwrap();
-}
-
-/// Gets the node name of the default PipeWire audio sink.
-fn get_default_sink_node_name() -> Option<String> {
-    match Command::new("pactl")
-        .arg("get-default-sink")
-        .output() {
-            Ok(output) if output.status.success() => {
-                let name = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
-                if name.is_empty() { None } else { Some(name) }
-            }
-            _ => None,
-        }
 }
 
 /// Convert a `pactl`/PipeWire bluez output node name into a MAC address string.
@@ -179,6 +179,8 @@ fn get_bt_battery(mac: &str) -> Option<u8> {
 /// (or `None` on spawn failure / timeout). The child keeps running detached if it
 /// overruns, but we stop waiting so the caller never blocks longer than `timeout`.
 fn bluetoothctl_info_with_timeout(mac: &str, timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    use std::sync::mpsc;
     let mut child = Command::new("bluetoothctl")
         .arg("info")
         .arg(mac)
@@ -207,21 +209,6 @@ fn bluetoothctl_info_with_timeout(mac: &str, timeout: Duration) -> Option<String
             None
         }
     }
-}
-
-/// Find the MAC of the first Bluetooth sink present in `pactl list sinks` output.
-fn bluez_mac_from_lines(lines: &[String]) -> Option<String> {
-    for line in lines {
-        if let Some(caps) = RE_SINK_NAME.captures(line.trim_end()) {
-            let name = &caps[1];
-            if name.starts_with("bluez_output.") {
-                if let Some(mac) = mac_from_sink_name(name) {
-                    return Some(mac);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Represents a PipeWire audio sink.
@@ -255,18 +242,27 @@ impl Sink {
     }
 }
 
-/// Fetches the PipeWire audio sink status as a list of lines
-/// from the output of the `pactl list sinks` command.
-fn fetch_sink_status() -> Result<Vec<String>, Box<dyn Error>> {
-    let output = Command::new("pactl")
-        .args(["list", "sinks"])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("pactl list sinks failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+/// Build a [`Sink`] from a native PulseAudio/PipeWire `SinkInfo`.
+fn sink_from_info(info: &SinkInfo) -> Sink {
+    let mut sink = Sink::default();
+    sink.sink_name = info.name.as_ref().map(|c| c.to_string()).unwrap_or_default();
+    sink.got_sink_name = !sink.sink_name.is_empty();
+    sink.mute = info.mute;
+    sink.got_mute = true;
+    sink.active = info.state == SinkState::Running;
+    // Volume as a percentage of the normal (100%) reference level.
+    sink.volume_percent =
+        (info.volume.avg().0 as f64 / Volume::NORMAL.0 as f64 * 100.0).round() as u16;
+    sink.got_volume = true;
+    // Prefer node.nick, then device.alias for the display name (matches prior behaviour).
+    if let Some(v) = info.proplist.get_str("node.nick").filter(|s| !s.is_empty()) {
+        sink.device_name = v;
+        sink.got_device_name = true;
+    } else if let Some(v) = info.proplist.get_str("device.alias").filter(|s| !s.is_empty()) {
+        sink.device_name = v;
+        sink.got_device_name = true;
     }
-    let full_output = String::from_utf8_lossy(&output.stdout);
-    Ok(full_output.lines().map(|l| l.to_owned()).collect())
-
+    sink
 }
 
 /// Gets the output to be displayed to the user.
@@ -335,32 +331,11 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
     } else {
         return Ok((String::new(), 0)); // No sinks found
     }
-    let mut s: Option<&Sink> = None;
-    // Try to match the active sink
-    for sink in &sinks {
-        if sink.active {
-            s = Some(sink);
-            break;
-        }
-    }
-    // Fallback to the default sink reported by pactl
-    if s.is_none() && default_sink_node.is_some() {
-        if let Some(d) = default_sink_node {
-            for sink in &sinks {
-                if sink.sink_name == d {
-                    s = Some(sink);
-                    break;
-                }
-            }
-        }
-    }
-    // If no active or default sinks, use the first one
-    if s.is_none() && !sinks.is_empty() {
-        s = Some(&sinks[0]);
-    } else if s.is_none() {
-        return Ok((String::new(), 0)); // No suitable sink
-    }
-    let s = s.unwrap();
+    let chosen = choose_sink(&sinks, default_sink_node.as_deref());
+    let s = match chosen {
+        Some(s) => s,
+        None => return Ok((String::new(), 0)), // No suitable sink
+    };
 
     // Best-effort: read a cached BlueZ battery value if this looks like a Bluetooth
     // sink. The actual (potentially blocking) D-Bus/bluetoothctl lookup happens on
@@ -374,6 +349,14 @@ pub fn get_output(default_sink_node: Option<String>, lines: Vec<String>, include
 
     // Delegate rendering to a pure helper so tests can mock the battery/formatting.
     render_sink_output(s, include_device_name, bt_battery)
+}
+
+/// Pick the sink to display: prefer a RUNNING sink, then the reported default sink,
+/// then the first available sink. Returns `None` only when the list is empty.
+fn choose_sink<'a>(sinks: &'a [Sink], default_sink_node: Option<&str>) -> Option<&'a Sink> {
+    sinks.iter().find(|s| s.active)
+        .or_else(|| default_sink_node.and_then(|d| sinks.iter().find(|s| s.sink_name == d)))
+        .or_else(|| sinks.first())
 }
 
 /// Render JSON output for a single `Sink` (pure, test-friendly).
@@ -414,283 +397,334 @@ fn render_sink_output(s: &Sink, include_device_name: bool, bt_battery: Option<u8
     Ok((json_output, if s.mute { 0 } else { s.volume_percent }))
 }
 
-
-/// PipeWire audio control API.
-pub struct Control {
-    pactl_event_thread_handle: Mutex<Option<JoinHandle<()>>>,
-    event_tx: Sender<u8>,
-    event_rx: Option<Receiver<u8>>,
-    active: bool,
+/// Mutable display/runtime state shared between the PulseAudio callbacks and the
+/// event loop. Everything lives on the single event-loop thread, so a plain
+/// `Rc<RefCell<..>>` is sufficient (no locking).
+struct State {
     show_device_name: bool,
-    config: Config,
+    show_bt_battery: bool,
     previous_line: String,
-    wob_stdin: Mutex<Option<ChildStdin>>,
+    last_volume: u16,
+    first_update: bool,
+    /// Default sink name as last reported by the server (for selection fallback).
+    default_sink: Option<String>,
+    /// Currently displayed sink + its raw volume, used to apply click actions.
+    cur_sink_name: Option<String>,
+    cur_volume: ChannelVolumes,
+    cur_mute: bool,
+    wob_stdin: Option<ChildStdin>,
+    /// MAC of the current Bluetooth sink (if any), read by the bt-poller thread.
+    current_bluez_mac: Arc<Mutex<Option<String>>>,
+}
+
+/// PipeWire/PulseAudio volume control for an i3blocks blocklet.
+///
+/// Holds a single persistent client connection to the PulseAudio-compatible
+/// server (pipewire-pulse) and reacts to native subscribe events. Because there
+/// is exactly one long-lived client, it never generates the client-churn events
+/// that a fork-per-update (`pactl`) design feeds back into itself.
+pub struct Control {
+    config: Config,
 }
 
 impl Control {
-    /// Gets the control for the given mixer.
     pub fn new(config: Config) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
-        Self {
-            pactl_event_thread_handle: Mutex::new(None),
-            event_tx,
-            event_rx: Some(event_rx),
-            active: true,
-            show_device_name: config.show_device_name,
-            config,
-            previous_line: String::new(),
-            wob_stdin: Mutex::new(None),
+        Self { config }
+    }
+
+    /// Run the blocklet event loop. Blocks until stdin closes or the connection dies.
+    pub fn run(self) -> Result<(), Box<dyn Error>> {
+        // Optional i3bar protocol header.
+        if self.config.print_header {
+            let header = Header { version: 1, click_events: Some(true), ..Default::default() };
+            println!("{}", serde_json::to_string(&header)?);
         }
-    }
 
-    /// Adjusts the volume by the given amount. Negative values request lowering the volume.
-    pub fn adjust_volume(&self, delta: i32) -> Result<(), Box<dyn Error>> {
-        if delta == 0 {
-            return Ok(())
-        }
-        let sign = if delta > 0 {"+"} else {"-"};
-        let delta_str = format!("{sign}{}%", delta.abs());
-        Command::new("pactl")
-            .args(["set-sink-volume", "@DEFAULT_SINK@", &delta_str])
-            .output()?;
-        Ok(())
-    }
+        // Optional `wob` overlay process.
+        let wob_stdin = if self.config.use_wob {
+            match Command::new("wob").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                Ok(mut child) => child.stdin.take(),
+                Err(e) => { eprintln!("Failed to spawn wob: {}", e); None }
+            }
+        } else {
+            None
+        };
 
-    /// Mutes or unmutes the given control.
-    pub fn toggle_mute(&self) -> Result<(), Box<dyn Error>> {
-        Command::new("pactl")
-            .args(["set-sink-mute", "@DEFAULT_SINK@", "toggle"])
-            .output()?;
-        Ok(())
-    }
+        let current_bluez_mac: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    /// Subscribes to change events.
-    pub fn subscribe(&mut self) -> Result<(), Box<dyn Error>> {
-        let tx_for_pactl_thread = self.event_tx.clone();
-        let jh: JoinHandle<()> = thread::Builder::new()
-            .name("pactl_subscribe_listener".to_string())
-            .stack_size(16 * 1024)
-            .spawn(move || {
-                let mut failures = Vec::new();
-                loop {
-                    let cmd_result = Command::new("pactl")
-                        .arg("subscribe")
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped()) // Capture stderr for better error reporting
-                        .spawn();
-
-                    match cmd_result {
-                        Ok(mut child) => {
-                            if let Some(stdout) = child.stdout.take() {
-                                let mut reader = BufReader::new(stdout);
-                                let mut line = String::new();
-                                loop {
-                                    match reader.read_line(&mut line) {
-                                        Ok(0) => break, // EOF, pactl exited
-                                        Ok(_) => {
-                                            if line.contains("change") && !line.contains("on client") {
-                                                if tx_for_pactl_thread.send(0).is_err() {
-                                                    // Receiver is gone, main loop likely exited
-                                                    _ = child.wait(); // Ensure child process is cleaned up
-                                                    return;
-                                                }
-                                            }
-                                            line.clear();
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Error reading from pactl subscribe: {}", e);
-                                            break; // Error, break to retry spawning pactl
-                                        }
-                                    }
-                                }
-                            } else {
-                                eprintln!("pactl subscribe: stdout not available.");
-                            }
-                            // Ensure that the child process is cleaned up and check status
-                            match child.wait() {
-                                Ok(status) => if !status.success() {
-                                    if let Some(code) = status.code() {
-                                        eprintln!("'pactl subscribe' exited with code: {}", code);
-                                    } else {
-                                        eprintln!("'pactl subscribe' terminated by signal");
-                                    }
-                                }
-                                Err(e) => eprintln!("Failed to wait on 'pactl subscribe': {}", e),
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to spawn 'pactl subscribe': {}", e);
-                            // Track failures and only allow 3 in the past second to prevent busy-looping
-                            let now = Instant::now();
-                            failures.retain(|&t| now.duration_since(t) < Duration::from_secs(1));
-                            failures.push(now);
-                            if failures.len() > 3 {
-                                eprintln!("'pactl subscribe' failed too many times, listener thread exiting.");
-                                return; // Exit thread
-                            }
-                            thread::sleep(Duration::from_millis(500)); // Wait before retrying
-                        }
-                    }
-                }
-            })
-            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
-
-        // poller thread: only spawn when BT battery lookups are enabled in the config.
-        // It performs the (potentially blocking) battery lookup here, off the event
-        // loop, then signals a refresh so the freshly cached value gets displayed.
+        // Background Bluetooth battery poller: warms BT_BATTERY_CACHE off the event
+        // loop (the D-Bus / bluetoothctl lookup may block), then flags a redraw.
+        let bt_dirty = Arc::new(AtomicBool::new(false));
         if self.config.show_bt_battery {
-            let tx_poll = self.event_tx.clone();
+            let mac_slot = current_bluez_mac.clone();
+            let dirty = bt_dirty.clone();
             thread::Builder::new().name("bt-poller".to_string()).spawn(move || {
                 loop {
-                    if let Ok(lines) = fetch_sink_status() {
-                        if let Some(mac) = bluez_mac_from_lines(&lines) {
-                            // Warms BT_BATTERY_CACHE; get_output only reads the cache.
-                            let _ = get_bt_battery(&mac);
+                    let mac = mac_slot.lock().unwrap().clone();
+                    if let Some(mac) = mac {
+                        if get_bt_battery(&mac).is_some() {
+                            dirty.store(true, Ordering::SeqCst);
                         }
-                    }
-                    if tx_poll.send(0).is_err() {
-                        return;
                     }
                     thread::sleep(Duration::from_secs(BT_POLL_INTERVAL_SECS));
                 }
-            }).expect("create poller thread");
+            })?;
         }
 
-        *self.pactl_event_thread_handle.lock().unwrap() = Some(jh);
+        let state = Rc::new(RefCell::new(State {
+            show_device_name: self.config.show_device_name,
+            show_bt_battery: self.config.show_bt_battery,
+            previous_line: String::new(),
+            last_volume: 0,
+            first_update: true,
+            default_sink: None,
+            cur_sink_name: None,
+            cur_volume: ChannelVolumes::default(),
+            cur_mute: false,
+            wob_stdin,
+            current_bluez_mac,
+        }));
+
+        // --- Connect to the server ---
+        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
+        let ctx = Rc::new(RefCell::new(
+            Context::new(&mainloop, "i3blocks-volume-pw").ok_or("failed to create PulseAudio context")?
+        ));
+        ctx.borrow_mut().connect(None, ContextFlagSet::NOFLAGS, None)?;
+
+        // Block until the context is ready (or fails).
+        loop {
+            match mainloop.iterate(true) {
+                IterateResult::Success(_) => {}
+                IterateResult::Quit(_) | IterateResult::Err(_) =>
+                    return Err("PulseAudio mainloop quit during connect".into()),
+            }
+            match ctx.borrow().get_state() {
+                ContextState::Ready => break,
+                ContextState::Failed | ContextState::Terminated =>
+                    return Err("PulseAudio connection failed".into()),
+                _ => {}
+            }
+        }
+
+        // --- Subscribe to sink and server changes ---
+        // Only SINK | SERVER: nothing here reacts to client events, so our own
+        // introspection queries can never re-trigger a refresh.
+        let dirty = Rc::new(std::cell::Cell::new(true)); // true => render once at startup
+        {
+            let dirty_cb = dirty.clone();
+            ctx.borrow_mut().set_subscribe_callback(Some(Box::new(move |_facility, _op, _idx| {
+                dirty_cb.set(true);
+            })));
+            ctx.borrow_mut().subscribe(InterestMaskSet::SINK | InterestMaskSet::SERVER, |_| {});
+        }
+
+        // Put stdin into non-blocking mode so we can poll clicks without blocking
+        // the event loop.
+        set_nonblocking(0);
+        let mut stdin_acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 1024];
+
+        // --- Event loop ---
+        loop {
+            match mainloop.iterate(false) {
+                IterateResult::Success(_) => {}
+                IterateResult::Quit(_) | IterateResult::Err(_) => break,
+            }
+
+            // Drain any pending click input.
+            let mut eof = false;
+            loop {
+                let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n > 0 {
+                    stdin_acc.extend_from_slice(&buf[..n as usize]);
+                } else if n == 0 {
+                    eof = true; // parent closed stdin
+                    break;
+                } else {
+                    break; // EAGAIN / no more data
+                }
+            }
+            while let Some(pos) = stdin_acc.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = stdin_acc.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&line);
+                self.handle_click_line(text.trim(), &ctx, &state, &dirty);
+            }
+            if eof { break; }
+
+            // Battery thread asked for a redraw.
+            if bt_dirty.swap(false, Ordering::SeqCst) {
+                dirty.set(true);
+            }
+
+            // Redraw if anything changed.
+            if dirty.replace(false) {
+                request_redraw(&ctx, &state);
+            }
+
+            thread::sleep(TICK);
+        }
+
         Ok(())
     }
 
-    /// Receives events and writes updates to stdout.
-    pub fn refresh_loop(&mut self) {
-        // Take the receiver. If it's already taken, something is wrong.
-        let event_rx = self.event_rx.take().expect("event_rx already taken in refresh_loop");
-
-        let mut stdout = io::stdout().lock();
-        if self.config.print_header {
-            // Print i3bar header
-            let header = Header {
-                version: 1,
-                click_events: Some(true),
-                ..Default::default()
-            };
-            let header_str = serde_json::to_string(&header).unwrap();
-            if writeln!(stdout, "{}", header_str).is_err() { self.active = false; return; }
-            if stdout.flush().is_err() { self.active = false; return; }
+    /// Handle one line of i3bar click JSON. Lines that don't parse as a click are
+    /// treated as a generic refresh request (matches the prior behaviour).
+    fn handle_click_line(&self, text: &str, ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>, dirty: &Rc<std::cell::Cell<bool>>) {
+        if text.is_empty() {
+            return;
         }
-
-        if self.config.use_wob {
-            let spawn_result = Command::new("wob")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Ok(mut child) = spawn_result {
-                *self.wob_stdin.lock().unwrap() = child.stdin.take();
-            } else {
-                eprintln!("Failed to spawn wob: {:?}", spawn_result);
-            }
-        }
-
-        let mut first_update = true;
-        let mut last_volume = 0u16;
-
-        while self.active {
-            // Block for the first event (with a 1s timeout so we can re-check active).
-            let first = match event_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(b) => b,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => { self.active = false; break; }
-            };
-
-            // Coalesce the whole burst that's already queued: net the volume deltas,
-            // collapse repeated mute / name toggles, and refresh display only once.
-            let mut net_volume: i32 = 0;
-            let mut mute_toggles: u32 = 0;
-            let mut name_toggles: u32 = 0;
-            let mut launch_app = false;
-            let mut generic_change = false;
-
-            let mut absorb = |button: u8| match button {
-                0 => generic_change = true,                          // pactl/poller change
-                1 => launch_app = true,                              // launch volume app
-                2 => mute_toggles += 1,                              // mute toggle
-                3 => name_toggles += 1,                              // toggle device name
-                4 => net_volume += self.config.audio_delta as i32,   // volume up
-                5 => net_volume -= self.config.audio_delta as i32,   // volume down
-                _ => {}
-            };
-            absorb(first);
-            while let Ok(b) = event_rx.try_recv() {
-                absorb(b);
-            }
-
-            // Apply the netted actions, each at most once.
-            let mut action_affects_display = false;
-            if mute_toggles % 2 == 1 {
-                _ = self.toggle_mute().map_err(|e| eprintln!("Error toggling mute: {}", e));
-                action_affects_display = true;
-            }
-            if net_volume != 0 {
-                _ = self.adjust_volume(net_volume).map_err(|e| eprintln!("Error adjusting volume: {}", e));
-                action_affects_display = true;
-            }
-            if name_toggles % 2 == 1 {
-                self.show_device_name = !self.show_device_name;
-                action_affects_display = true;
-            }
-            if launch_app {
-                _ = Command::new(&self.config.volume_control_app).spawn().map_err(|e| eprintln!("Error spawning volume app: {}", e));
-            }
-
-            // Perform update if:
-            // 1. It's the very first update.
-            // 2. A pactl/poller change event occurred.
-            // 3. A click action that affects the display was taken.
-            if first_update || generic_change || action_affects_display {
-                match fetch_sink_status() {
-                    Ok(lines) => {
-                        match get_output(get_default_sink_node_name(), lines, self.show_device_name, self.config.show_bt_battery) {
-                            Ok((line_str, volume_percent)) => {
-                                // Update stdout if content changed or if it's the first update
-                                if line_str != self.previous_line || first_update {
-                                    if writeln!(stdout, "{}", line_str).is_err() { self.active = false; break; }
-                                    if io::stdout().flush().is_err() { self.active = false; break; }
-                                    self.previous_line = line_str;
-                                }
-                                // Update wob if volume changed (and not the first update)
-                                if last_volume != volume_percent && !first_update {
-                                    if let Some(wob_stdin_guard) = self.wob_stdin.lock().unwrap().as_mut() {
-                                        let vol_str = format!("{}\n", volume_percent);
-                                        if wob_stdin_guard.write_all(vol_str.as_bytes()).is_err() || wob_stdin_guard.flush().is_err() {
-                                            eprintln!("Error writing to wob, disabling wob output.");
-                                            *self.wob_stdin.lock().unwrap() = None; // Stop trying to use wob
-                                        }
-                                    }
-                                }
-                                last_volume = volume_percent;
-                                if first_update { first_update = false; }
-                            }
-                            Err(e) => eprintln!("Error getting output: {}", e),
-                        }
-                    }
-                    Err(e) => eprintln!("Error fetching sink status: {}", e),
+        let button = match parse_click(text) {
+            Ok(click) => click.button,
+            Err(_) => { dirty.set(true); return; } // non-click line: refresh
+        };
+        match button {
+            1 => {
+                if let Err(e) = Command::new(&self.config.volume_control_app).spawn() {
+                    eprintln!("Error spawning volume app: {}", e);
                 }
             }
+            2 => set_mute_toggle(ctx, state),
+            3 => {
+                let mut s = state.borrow_mut();
+                s.show_device_name = !s.show_device_name;
+                drop(s);
+                dirty.set(true);
+            }
+            4 => adjust_volume(ctx, state, self.config.audio_delta as i32),
+            5 => adjust_volume(ctx, state, -(self.config.audio_delta as i32)),
+            _ => dirty.set(true),
         }
-    }
-
-    pub fn tx(&self) -> Sender<u8> {
-        self.event_tx.clone()
     }
 }
 
-impl Drop for Control {
-    fn drop(&mut self) {
-        self.active = false;
-        // Do not block on joining background threads during drop (tests would hang).
-        // Remove stored handle so the JoinHandle is dropped (thread keeps running until it exits).
-        let _ = self.pactl_event_thread_handle.lock().unwrap().take();
+/// Apply a relative volume change (in percent) to the current sink.
+fn adjust_volume(ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>, delta_pct: i32) {
+    if delta_pct == 0 {
+        return;
+    }
+    let (name, mut cv) = {
+        let s = state.borrow();
+        match &s.cur_sink_name {
+            Some(n) => (n.clone(), s.cur_volume),
+            None => return,
+        }
+    };
+    let step = Volume((Volume::NORMAL.0 as f64 * (delta_pct.unsigned_abs() as f64 / 100.0)) as u32);
+    if delta_pct > 0 {
+        cv.increase(step);
+    } else {
+        cv.decrease(step);
+    }
+    // Fire-and-forget: the resulting sink change event triggers a redraw.
+    ctx.borrow().introspect().set_sink_volume_by_name(&name, &cv, None);
+}
+
+/// Toggle mute on the current sink.
+fn set_mute_toggle(ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>) {
+    let (name, mute) = {
+        let s = state.borrow();
+        match &s.cur_sink_name {
+            Some(n) => (n.clone(), !s.cur_mute),
+            None => return,
+        }
+    };
+    ctx.borrow().introspect().set_sink_mute_by_name(&name, mute, None);
+}
+
+/// Query the server for the default sink, then the full sink list, and render the
+/// chosen sink. All callbacks run on the event-loop thread.
+fn request_redraw(ctx: &Rc<RefCell<Context>>, state: &Rc<RefCell<State>>) {
+    let ctx_for_list = ctx.clone();
+    let state_for_srv = state.clone();
+    // First learn the default sink name, then list sinks (so selection is correct).
+    ctx.borrow().introspect().get_server_info(move |info| {
+        state_for_srv.borrow_mut().default_sink =
+            info.default_sink_name.as_ref().map(|c| c.to_string());
+
+        let scratch: Rc<RefCell<Vec<(Sink, ChannelVolumes)>>> = Rc::new(RefCell::new(Vec::new()));
+        let state_for_end = state_for_srv.clone();
+        let scratch_cb = scratch.clone();
+        ctx_for_list.borrow().introspect().get_sink_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                scratch_cb.borrow_mut().push((sink_from_info(info), info.volume));
+            }
+            ListResult::End => finalize_render(&state_for_end, &scratch_cb.borrow()),
+            ListResult::Error => {}
+        });
+    });
+}
+
+/// Select the sink to show, update shared state, and print the i3bar line if it changed.
+fn finalize_render(state: &Rc<RefCell<State>>, sinks: &[(Sink, ChannelVolumes)]) {
+    let mut s = state.borrow_mut();
+
+    let chosen = {
+        let sink_views: Vec<&Sink> = sinks.iter().map(|(k, _)| k).collect();
+        match choose_sink_idx(&sink_views, s.default_sink.as_deref()) {
+            Some(i) => i,
+            None => return,
+        }
+    };
+    let (sink, volume) = &sinks[chosen];
+
+    // Bluetooth battery (cached only; warmed off-loop by the poller thread).
+    let mac = if sink.sink_name.starts_with("bluez_output.") {
+        mac_from_sink_name(&sink.sink_name)
+    } else {
+        None
+    };
+    let bt_battery = if s.show_bt_battery {
+        mac.as_deref().and_then(cached_bt_battery)
+    } else {
+        None
+    };
+    *s.current_bluez_mac.lock().unwrap() = mac;
+
+    // Remember the current sink so click actions can act on it.
+    s.cur_sink_name = Some(sink.sink_name.clone());
+    s.cur_volume = *volume;
+    s.cur_mute = sink.mute;
+
+    let include_name = s.show_device_name;
+    match render_sink_output(sink, include_name, bt_battery) {
+        Ok((line, vol_pct)) => {
+            if line != s.previous_line || s.first_update {
+                let mut out = io::stdout().lock();
+                if writeln!(out, "{}", line).is_err() || out.flush().is_err() {
+                    return;
+                }
+                s.previous_line = line;
+            }
+            if s.last_volume != vol_pct && !s.first_update {
+                if let Some(w) = s.wob_stdin.as_mut() {
+                    if write!(w, "{}\n", vol_pct).is_err() || w.flush().is_err() {
+                        eprintln!("Error writing to wob, disabling wob output.");
+                        s.wob_stdin = None;
+                    }
+                }
+            }
+            s.last_volume = vol_pct;
+            s.first_update = false;
+        }
+        Err(e) => eprintln!("Error rendering output: {}", e),
+    }
+}
+
+/// Index-returning variant of [`choose_sink`] used by the native render path.
+fn choose_sink_idx(sinks: &[&Sink], default_sink_node: Option<&str>) -> Option<usize> {
+    sinks.iter().position(|s| s.active)
+        .or_else(|| default_sink_node.and_then(|d| sinks.iter().position(|s| s.sink_name == d)))
+        .or_else(|| if sinks.is_empty() { None } else { Some(0) })
+}
+
+/// Put a file descriptor into non-blocking mode (best-effort).
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 
@@ -836,20 +870,6 @@ mod test {
     }
 
     #[test]
-    fn subscribe_creates_poller_thread() {
-        let cfg = Config { audio_delta: 5, volume_control_app: "pavucontrol".to_string(), show_device_name: false, show_bt_battery: false, print_header: false, use_wob: false };
-        let mut c = Control::new(cfg);
-        c.subscribe().unwrap();
-        // pactl listener thread handle should be present
-        assert!(c.pactl_event_thread_handle.lock().unwrap().is_some());
-        // sending on tx should succeed (receiver present)
-        assert!(c.tx().send(0).is_ok());
-        // drop the receiver so background threads can exit, then drop control
-        c.event_rx = None;
-        drop(c);
-    }
-
-    #[test]
     fn mac_from_sink_name_lowercase() {
         assert_eq!(mac_from_sink_name("bluez_output.00_1a_7d_da_71_13.a2dp-sink"), Some("00:1A:7D:DA:71:13".to_string()));
     }
@@ -881,48 +901,24 @@ mod test {
         assert_eq!(parse_bluetoothctl_info_output(s), None);
     }
 
-    /// Live debugging test (ignored by default).
-    ///
-    /// Run locally with:
-    ///   cargo test live_bt_battery_debug -- --ignored --nocapture
-    ///
-    /// This will print detected bluez sinks, the derived MAC and the result of the
-    /// BlueZ Battery1 lookup so you can see where the lookup is failing on your machine.
     #[test]
-    #[ignore]
-    fn live_bt_battery_debug() {
-        let lines = fetch_sink_status().unwrap();
-        let mut found: Option<String> = None;
-        for line in &lines {
-            if line.trim_start().starts_with("Name: ") {
-                let name = line.trim()[6..].trim().to_string();
-                if name.starts_with("bluez_output.") {
-                    found = Some(name);
-                    break;
-                }
-            }
-        }
+    fn choose_sink_prefers_running() {
+        let mut a = Sink::default(); a.sink_name = "a".into();
+        let mut b = Sink::default(); b.sink_name = "b".into(); b.active = true;
+        let sinks = vec![a, b];
+        assert_eq!(choose_sink(&sinks, Some("a")).unwrap().sink_name, "b");
+    }
 
-        if found.is_none() {
-            eprintln!("No bluez_output sink found in pactl output; skipping live test.");
-            return;
-        }
-
-        let sink_name = found.unwrap();
-        eprintln!("Found bluez sink name: {}", sink_name);
-
-        let mac = mac_from_sink_name(&sink_name);
-        eprintln!("mac_from_sink_name -> {:?}", mac);
-        if mac.is_none() {
-            eprintln!("mac_from_sink_name failed to parse {}; skipping live debug.", sink_name);
-            return;
-        }
-        let mac = mac.unwrap();
-
-        eprintln!("(live) get_bt_battery -> {:?}", get_bt_battery(&mac));
-
-        let (status_line, volume) = get_output(get_default_sink_node_name(), fetch_sink_status().unwrap(), true, true).unwrap();
-        eprintln!("get_output -> {}", status_line);
-        eprintln!("volume -> {}", volume);
+    #[test]
+    fn choose_sink_falls_back_to_default_then_first() {
+        let mut a = Sink::default(); a.sink_name = "a".into();
+        let mut b = Sink::default(); b.sink_name = "b".into();
+        let sinks = vec![a, b];
+        // default match wins over first
+        assert_eq!(choose_sink(&sinks, Some("b")).unwrap().sink_name, "b");
+        // no default -> first
+        assert_eq!(choose_sink(&sinks, None).unwrap().sink_name, "a");
+        // empty -> none
+        assert!(choose_sink(&[], Some("x")).is_none());
     }
 }
